@@ -9,6 +9,7 @@ from pathlib import Path
 
 import duckdb
 import yaml
+from build_demo import METERS_PER_DEGREE, OVERLAP_M, SLIVER_M, SNAP_M, TOPO_GAP_M
 from build_nld import ADMIN, YEARS, dataset_feed
 
 LEVEL = {admin: level for level, admin in ADMIN.items()}
@@ -45,7 +46,7 @@ DESCRIPTION = {
 DEMO = {
     "": {
         "title": "Netherlands demo inputs",
-        "description": "Input layers for trying each topo-tools tool on Dutch boundaries. Each folder is named after the tool it's for and holds the files that tool takes, simplified to 100 m. Running a tool on its input produces the output, which is never stored here. See [AGENTS.md](AGENTS.md).",
+        "description": "Input layers for trying each topo-tools tool on Dutch boundaries. Each folder is named after the tool or tool family it's for and holds the files that tool takes, simplified to 100 m. Running a tool on its input produces the output, which is never stored here. See [AGENTS.md](AGENTS.md).",
     },
     "schema-map": {
         "title": "Gemeenten 2025",
@@ -59,7 +60,7 @@ DEMO = {
             "topo-tools",
             "schema-map",
         ],
-        "processing_notes": "Built by `catalog/build_demo.py` in [topo-tools-py](https://github.com/OCHA-DAP/topo-tools-py) from the land rows of `nld/2025/nld_admin2`: `ST_CoverageSimplify` at 100 m, then `ST_CoverageClean` with 0.01 m snapping and no gap filling. Provincie columns joined on `gemeentecode` from the CBS StatLine [OData table 86059NED](https://opendata.cbs.nl/ODataApi/odata/86059NED/TypedDataSet?$format=json&$select=RegioS,Code_28,Naam_29).",
+        "processing_notes": "Built by `catalog/build_demo.py` in [topo-tools-data](https://github.com/OCHA-DAP/topo-tools-data) from the land rows of `nld/2025/nld_admin2`: `ST_CoverageSimplify` at 100 m, then `ST_CoverageClean` with 0.01 m snapping and no gap filling. Provincie columns joined on `gemeentecode` from the CBS StatLine [OData table 86059NED](https://opendata.cbs.nl/ODataApi/odata/86059NED/TypedDataSet?$format=json&$select=RegioS,Code_28,Naam_29).",
     },
     "schema-join": {
         "title": "Gemeenten and provincies 2025",
@@ -74,8 +75,22 @@ DEMO = {
             "topo-tools",
             "schema-join",
         ],
-        "processing_notes": "Built by `catalog/build_demo.py` in [topo-tools-py](https://github.com/OCHA-DAP/topo-tools-py): gemeenten from the land rows of `nld/2025/nld_admin2`, and provincies from the PDOK [Bestuurlijke Gebieden OGC API](https://api.pdok.nl/kadaster/bestuurlijkegebieden/ogc/v1) (`provinciegebied`, retrieved 2026-09-28). Each layer is simplified with `ST_CoverageSimplify` at 100 m, then `ST_CoverageClean` with 0.01 m snapping and no gap filling.",
+        "processing_notes": "Built by `catalog/build_demo.py` in [topo-tools-data](https://github.com/OCHA-DAP/topo-tools-data): gemeenten from the land rows of `nld/2025/nld_admin2`, and provincies from the PDOK [Bestuurlijke Gebieden OGC API](https://api.pdok.nl/kadaster/bestuurlijkegebieden/ogc/v1) (`provinciegebied`, retrieved 2026-09-28). Each layer is simplified with `ST_CoverageSimplify` at 100 m, then `ST_CoverageClean` with 0.01 m snapping and no gap filling.",
     },
+}
+DEMO["topo"] = {
+    "title": "Gemeenten 2025 with digitization errors",
+    "description": "The 342 land gemeenten from the CBS Wijk- en Buurtkaart 2025, in EPSG:28992 with `adm2_code` and `adm2_name`, simplified to 100 m. Two gemeenten overlap their neighbours and three have a sliver gap under 1 m wide along one border. Running topo-detect reports them alongside the water bodies, which are real gaps. Running topo-clean with a 2 m maximum gap width fixes the errors and leaves the water open. See [AGENTS.md](AGENTS.md).",
+    "keywords": [
+        "administrative boundaries",
+        "Netherlands",
+        "CBS",
+        "gemeenten",
+        "topo-tools",
+        "topo-detect",
+        "topo-clean",
+    ],
+    "processing_notes": "Built by `catalog/build_demo.py` in [topo-tools-data](https://github.com/OCHA-DAP/topo-tools-data) from the land rows of `nld/2025/nld_admin2`: `ST_CoverageSimplify` at 100 m, then `ST_CoverageClean` with 0.01 m snapping and no gap filling. Utrecht and Eindhoven are then buffered 200 m outward, and Amersfoort, Apeldoorn and Tilburg each lose a strip 0.25 m, 0.5 m and 1 m wide along their border with Leusden, Epe and Oisterwijk.",
 }
 for fields in DEMO.values():
     fields.setdefault(
@@ -98,6 +113,12 @@ JOIN_COLUMNS = {
     "adm1_name": "Provincie name, from Kadaster.",
     "bbox": COLUMNS["bbox"],
 }
+TOPO_COLUMNS = {
+    "geometry": "Polygon or MultiPolygon in EPSG:28992 (RD New, metres), simplified to 100 m with `ST_CoverageSimplify`, with the digitization errors listed in AGENTS.md.",
+    "adm2_code": JOIN_COLUMNS["adm2_code"],
+    "adm2_name": JOIN_COLUMNS["adm2_name"],
+    "bbox": COLUMNS["bbox"],
+}
 PROVINCIES = {
     "Groningen": "#a6cee3",
     "Fryslân": "#1f78b4",
@@ -114,6 +135,7 @@ PROVINCIES = {
 }
 
 DATA = "https://data.source.coop/hdx/topo-tools"
+WEB = "https://ocha-dap.github.io/topo-tools-js"
 TEMPLATES = Path(__file__).parent / "agents"
 REVISION = {2021: 3, 2022: 3, 2023: 3, 2024: 2, 2025: 1}
 UNIT = {
@@ -457,6 +479,47 @@ def annotate_schema_join(collection_dir: Path) -> None:
     )
 
 
+def annotate_topo(collection_dir: Path, cache: Path) -> None:
+    demo_collection(collection_dir, TOPO_COLUMNS)
+    url = f"{DATA}/nld/demo/topo/nld_admin2.parquet"
+    con = duckdb.connect()
+    con.execute("LOAD spatial")
+    names = dict(
+        con.execute(
+            f"SELECT adm2_code, adm2_name FROM read_parquet('{collection_dir / 'nld_admin2.parquet'}')"
+        ).fetchall()
+    )
+    issues = f"read_parquet('{cache / 'topo_nld_admin2_issues.parquet'}')"
+    overlap_issues, gap_issues, noise_gaps = con.execute(
+        f"SELECT count(*) FILTER (kind = 'overlap'), count(*) FILTER (kind = 'gap'), "
+        f"count(*) FILTER (kind = 'gap' AND max_width_m < {SNAP_M}) FROM {issues}"
+    ).fetchone()
+    water_gaps, water_min_m = con.execute(
+        f"SELECT count(*), min(max_width_m) FROM {issues} WHERE kind = 'gap' AND max_width_m > {TOPO_GAP_M}"
+    ).fetchone()
+    (collection_dir / "AGENTS.md").write_text(
+        template(
+            "demo_topo",
+            title=DEMO["topo"]["title"],
+            rows=str(len(names)),
+            overlaps=", ".join(names[code] for code in OVERLAP_M),
+            overlap_m=", ".join(sorted({f"{m:g}" for m in OVERLAP_M.values()})),
+            slivers=", ".join(names[code] for code in SLIVER_M),
+            sliver_m=", ".join(f"{m:g}" for _, m in SLIVER_M.values()),
+            url=url,
+            gap_m=f"{TOPO_GAP_M:g}",
+            gap_deg=f"{TOPO_GAP_M / METERS_PER_DEGREE:.6f}",
+            overlap_issues=str(overlap_issues),
+            gap_issues=str(gap_issues),
+            sliver_count=str(len(SLIVER_M)),
+            water_gaps=str(water_gaps),
+            noise_gaps=str(noise_gaps),
+            water_min_m=f"{water_min_m:.1f}",
+            web=WEB,
+        )
+    )
+
+
 def apply_titles(catalog: Path) -> None:
     for metadata in catalog.rglob(".portolan/metadata.yaml"):
         fields = yaml.safe_load(metadata.read_text()) or {}
@@ -515,6 +578,7 @@ def main() -> None:
             (demo / "AGENTS.md").write_text(template("demo"))
             annotate_schema_map(demo / "schema-map", args.cache / "demo")
             annotate_schema_join(demo / "schema-join")
+            annotate_topo(demo / "topo", args.cache / "demo")
 
 
 if __name__ == "__main__":

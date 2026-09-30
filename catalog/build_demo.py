@@ -7,10 +7,22 @@ import duckdb
 from build_nld import get
 from topo_tools.api.schema_join import join
 from topo_tools.api.schema_map import map as schema_map
+from topo_tools.api.topo_clean import clean
 from topo_tools.api.topo_detect import detect
 
 SIMPLIFY_M = 100.0
 SNAP_M = 0.01
+# Utrecht and Eindhoven grow 200 m into their neighbours.
+OVERLAP_M = {"GM0344": 200.0, "GM0772": 200.0}
+# Amersfoort, Apeldoorn and Tilburg each lose a strip this wide along their border with a neighbour.
+SLIVER_M = {
+    "GM0307": ("GM0327", 0.25),
+    "GM0200": ("GM0232", 0.5),
+    "GM0855": ("GM0824", 1.0),
+}
+# Wider than every sliver, narrower than every water gap. Matches topo-clean's `gap` URL param.
+TOPO_GAP_M = 2.0
+METERS_PER_DEGREE = 111_320
 # CBS StatLine "Gebieden in Nederland 2025"; Code_28/Naam_29 are its Provincies group.
 GEBIEDEN = "https://opendata.cbs.nl/ODataApi/odata/86059NED/TypedDataSet?$format=json&$select=RegioS,Code_28,Naam_29"
 PROVINCIEGEBIED = "https://api.pdok.nl/kadaster/bestuurlijkegebieden/ogc/v1/collections/provinciegebied/items?f=json&limit=100&crs=http://www.opengis.net/def/crs/EPSG/0/28992"
@@ -105,12 +117,58 @@ def schema_join_layer(provinciegebied: Path, out: Path) -> None:
     )
 
 
-def overlaps(path: Path, cache: Path) -> int:
+def topo_input(con: duckdb.DuckDBPyConnection, out: Path) -> None:
+    overlaps = ", ".join(f"('{code}', {m})" for code, m in OVERLAP_M.items())
+    slivers = ", ".join(f"('{a}', '{b}', {m})" for a, (b, m) in SLIVER_M.items())
+    copy(
+        con,
+        f"""
+        SELECT CASE
+                WHEN o.m IS NOT NULL THEN ST_Buffer(g.geometry::GEOMETRY, o.m)
+                WHEN s.m IS NOT NULL THEN ST_Difference(g.geometry::GEOMETRY, ST_Buffer(n.geometry::GEOMETRY, s.m))
+                ELSE g.geometry::GEOMETRY
+            END::GEOMETRY('EPSG:28992') AS geometry,
+            g.gemeentecode AS adm2_code, g.gemeentenaam AS adm2_name
+        FROM g
+        LEFT JOIN (VALUES {overlaps}) o(code, m) ON o.code = g.gemeentecode
+        LEFT JOIN (VALUES {slivers}) s(code, neighbour, m) ON s.code = g.gemeentecode
+        LEFT JOIN g n ON n.gemeentecode = s.neighbour
+        ORDER BY adm2_code
+        """,
+        out,
+    )
+
+
+def issue_counts(path: Path, cache: Path) -> dict[str, int]:
+    """Count issues by kind, leaving out zero-width noise gaps."""
     issues = cache / f"{path.parent.name}_{path.stem}_issues.parquet"
     detect(path, issues, tmp_dir=cache / "tmp")
-    return duckdb.sql(
-        f"SELECT count(*) FROM read_parquet('{issues}') WHERE kind = 'overlap'"
-    ).fetchone()[0]
+    return dict(
+        duckdb.sql(
+            f"SELECT kind, count(*) FROM read_parquet('{issues}') "
+            f"WHERE kind <> 'gap' OR max_width_m >= {SNAP_M} GROUP BY kind"
+        ).fetchall()
+    )
+
+
+def check_topo(path: Path, water_gaps: int, cache: Path) -> None:
+    slivers = len(SLIVER_M)
+    counts = issue_counts(path, cache)
+    if counts.get("gap") != water_gaps + slivers or not counts.get("overlap"):
+        msg = f"{path}: {counts}, expected {water_gaps} water and {slivers} sliver gaps plus overlaps"
+        raise SystemExit(msg)
+    out = cache / "topo" / "nld_admin2_clean.parquet"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    clean(
+        path,
+        out,
+        out.with_stem(out.stem + "_issues"),
+        maximum_gap_width=str(TOPO_GAP_M / METERS_PER_DEGREE),
+        tmp_dir=cache / "tmp",
+    )
+    if (cleaned := issue_counts(out, cache)) != {"gap": water_gaps}:
+        msg = f"topo-clean at {TOPO_GAP_M} m left {cleaned}, expected only the {water_gaps} water gaps"
+        raise SystemExit(msg)
 
 
 def join_issues(input_path: Path, join_path: Path, cache: Path) -> int:
@@ -136,16 +194,21 @@ def main() -> None:
     raw = demo / "schema-map" / "nld_admin2.parquet"
     input_path = demo / "schema-join" / "nld_admin2.parquet"
     join_path = demo / "schema-join" / "nld_admin1.parquet"
+    topo_path = demo / "topo" / "nld_admin2.parquet"
     mapped = args.cache / "schema-map" / "nld_admin2_mapped.parquet"
 
     con = gemeenten(src, cached(GEBIEDEN, args.cache / "gebieden_2025.json"))
     schema_map_input(con, raw)
     schema_join_input(con, input_path)
+    topo_input(con, topo_path)
     schema_join_layer(
         cached(PROVINCIEGEBIED, args.cache / "provinciegebied.json"), join_path
     )
-    for path in (raw, input_path, join_path):
-        if n := overlaps(path, args.cache):
+    counts = {
+        path: issue_counts(path, args.cache) for path in (raw, input_path, join_path)
+    }
+    for path, kinds in counts.items():
+        if n := kinds.get("overlap", 0):
             msg = f"{path}: {n} overlaps after simplify and clean"
             raise SystemExit(msg)
     schema_map(
@@ -157,6 +220,7 @@ def main() -> None:
     if n := join_issues(input_path, join_path, args.cache):
         msg = f"schema-join reported {n} issues"
         raise SystemExit(msg)
+    check_topo(topo_path, counts[input_path]["gap"], args.cache)
 
 
 if __name__ == "__main__":
