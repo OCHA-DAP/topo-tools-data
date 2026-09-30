@@ -1,0 +1,8 @@
+fix = true
+
+[lint]
+select = ["ALL"]
+ignore = ["COM812", "CPY001", "D203", "D213", "S603", "S607", "S608"]
+
+[lint.per-file-ignores]
+"catalog/*" = ["D103", "E501", "INP001"]
