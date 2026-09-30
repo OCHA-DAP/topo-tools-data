@@ -9,7 +9,7 @@ from pathlib import Path
 
 import duckdb
 import yaml
-from build_demo import METERS_PER_DEGREE, OVERLAP_M, SLIVER_M, SNAP_M, TOPO_GAP_M
+from build_demo import DISPLACED
 from build_nld import ADMIN, YEARS, dataset_feed
 
 LEVEL = {admin: level for level, admin in ADMIN.items()}
@@ -80,7 +80,7 @@ DEMO = {
 }
 DEMO["topo"] = {
     "title": "Gemeenten 2025 with digitization errors",
-    "description": "The 342 land gemeenten from the CBS Wijk- en Buurtkaart 2025, in EPSG:28992 with `adm2_code` and `adm2_name`, simplified to 100 m. Two gemeenten overlap their neighbours and three have a sliver gap under 1 m wide along one border. Running topo-detect reports them alongside the water bodies, which are real gaps. Running topo-clean with a 2 m maximum gap width fixes the errors and leaves the water open. See [AGENTS.md](AGENTS.md).",
+    "description": "The 343 gemeenten from the CBS Wijk- en Buurtkaart 2025, each with its water, in EPSG:28992 with `adm2_code` and `adm2_name`, simplified to 100 m. Five border vertices are moved 15 to 30 m, giving two overlaps and three gaps. Running topo-detect reports those five issues. Running topo-clean with the thin maximum gap width fixes all five. See [AGENTS.md](AGENTS.md).",
     "keywords": [
         "administrative boundaries",
         "Netherlands",
@@ -90,7 +90,7 @@ DEMO["topo"] = {
         "topo-detect",
         "topo-clean",
     ],
-    "processing_notes": "Built by `catalog/build_demo.py` in [topo-tools-data](https://github.com/OCHA-DAP/topo-tools-data) from the land rows of `nld/2025/nld_admin2`: `ST_CoverageSimplify` at 100 m, then `ST_CoverageClean` with 0.01 m snapping and no gap filling. Utrecht and Eindhoven are then buffered 200 m outward, and Amersfoort, Apeldoorn and Tilburg each lose a strip 0.25 m, 0.5 m and 1 m wide along their border with Leusden, Epe and Oisterwijk.",
+    "processing_notes": "Built by `catalog/build_demo.py` in [topo-tools-data](https://github.com/OCHA-DAP/topo-tools-data) from `nld/2025/nld_admin2`: land and water rows unioned per `gemeentecode`, `ST_CoverageSimplify` at 100 m, then `ST_CoverageClean` with 0.01 m snapping and no gap filling. One vertex on each of five shared borders is then moved perpendicular to the border, into the neighbour for an overlap or back into the gemeente for a gap.",
 }
 for fields in DEMO.values():
     fields.setdefault(
@@ -489,32 +489,25 @@ def annotate_topo(collection_dir: Path, cache: Path) -> None:
             f"SELECT adm2_code, adm2_name FROM read_parquet('{collection_dir / 'nld_admin2.parquet'}')"
         ).fetchall()
     )
-    issues = f"read_parquet('{cache / 'topo_nld_admin2_issues.parquet'}')"
-    overlap_issues, gap_issues, noise_gaps = con.execute(
-        f"SELECT count(*) FILTER (kind = 'overlap'), count(*) FILTER (kind = 'gap'), "
-        f"count(*) FILTER (kind = 'gap' AND max_width_m < {SNAP_M}) FROM {issues}"
-    ).fetchone()
-    water_gaps, water_min_m = con.execute(
-        f"SELECT count(*), min(max_width_m) FROM {issues} WHERE kind = 'gap' AND max_width_m > {TOPO_GAP_M}"
+    overlap_issues, gap_issues, min_w, max_w = con.execute(
+        "SELECT count(*) FILTER (kind = 'overlap'), count(*) FILTER (kind = 'gap'), "
+        "min(max_width_m), max(max_width_m) "
+        f"FROM read_parquet('{cache / 'topo_nld_admin2_issues.parquet'}')"
     ).fetchone()
     (collection_dir / "AGENTS.md").write_text(
         template(
             "demo_topo",
             title=DEMO["topo"]["title"],
             rows=str(len(names)),
-            overlaps=", ".join(names[code] for code in OVERLAP_M),
-            overlap_m=", ".join(sorted({f"{m:g}" for m in OVERLAP_M.values()})),
-            slivers=", ".join(names[code] for code in SLIVER_M),
-            sliver_m=", ".join(f"{m:g}" for _, m in SLIVER_M.values()),
+            errors="\n".join(
+                f"| {'Overlap' if m > 0 else 'Gap'} | {names[unit]} | {names[neighbour]} | {abs(m):g} m |"
+                for unit, neighbour, m in DISPLACED
+            ),
             url=url,
-            gap_m=f"{TOPO_GAP_M:g}",
-            gap_deg=f"{TOPO_GAP_M / METERS_PER_DEGREE:.6f}",
             overlap_issues=str(overlap_issues),
             gap_issues=str(gap_issues),
-            sliver_count=str(len(SLIVER_M)),
-            water_gaps=str(water_gaps),
-            noise_gaps=str(noise_gaps),
-            water_min_m=f"{water_min_m:.1f}",
+            min_w=f"{min_w:.0f}",
+            max_w=f"{max_w:.0f}",
             web=WEB,
         )
     )

@@ -1,6 +1,8 @@
 """Build the hdx/topo-tools NLD demo inputs: one folder per topo-tools tool."""
 
 import argparse
+import json
+import math
 from pathlib import Path
 
 import duckdb
@@ -12,17 +14,15 @@ from topo_tools.api.topo_detect import detect
 
 SIMPLIFY_M = 100.0
 SNAP_M = 0.01
-# Utrecht and Eindhoven grow 200 m into their neighbours.
-OVERLAP_M = {"GM0344": 200.0, "GM0772": 200.0}
-# Amersfoort, Apeldoorn and Tilburg each lose a strip this wide along their border with a neighbour.
-SLIVER_M = {
-    "GM0307": ("GM0327", 0.25),
-    "GM0200": ("GM0232", 0.5),
-    "GM0855": ("GM0824", 1.0),
-}
-# Wider than every sliver, narrower than every water gap. Matches topo-clean's `gap` URL param.
-TOPO_GAP_M = 2.0
-METERS_PER_DEGREE = 111_320
+# (unit, neighbour, metres): one vertex on their shared border moves into the neighbour
+# (positive, an overlap) or back into the unit (negative, a gap).
+DISPLACED = [
+    ("GM0344", "GM0310", 30.0),
+    ("GM0363", "GM0362", 25.0),
+    ("GM0599", "GM0542", -20.0),
+    ("GM0772", "GM0861", -15.0),
+    ("GM0014", "GM1966", -25.0),
+]
 # CBS StatLine "Gebieden in Nederland 2025"; Code_28/Naam_29 are its Provincies group.
 GEBIEDEN = "https://opendata.cbs.nl/ODataApi/odata/86059NED/TypedDataSet?$format=json&$select=RegioS,Code_28,Naam_29"
 PROVINCIEGEBIED = "https://api.pdok.nl/kadaster/bestuurlijkegebieden/ogc/v1/collections/provinciegebied/items?f=json&limit=100&crs=http://www.opengis.net/def/crs/EPSG/0/28992"
@@ -117,24 +117,86 @@ def schema_join_layer(provinciegebied: Path, out: Path) -> None:
     )
 
 
-def topo_input(con: duckdb.DuckDBPyConnection, out: Path) -> None:
-    overlaps = ", ".join(f"('{code}', {m})" for code, m in OVERLAP_M.items())
-    slivers = ", ".join(f"('{a}', '{b}', {m})" for a, (b, m) in SLIVER_M.items())
+def rings(geometry: dict) -> list[list[list[float]]]:
+    polygons = geometry["coordinates"]
+    if geometry["type"] == "Polygon":
+        polygons = [polygons]
+    return [ring for polygon in polygons for ring in polygon]
+
+
+def displace(
+    con: duckdb.DuckDBPyConnection,
+    geoms: dict[str, dict],
+    unit: str,
+    neighbour: str,
+    m: float,
+) -> None:
+    """Move the middle vertex of `unit`'s border with `neighbour` `m` metres across it."""
+    owners: dict[tuple[float, float], set[str]] = {}
+    for code, geometry in geoms.items():
+        for ring in rings(geometry):
+            for v in ring:
+                owners.setdefault(tuple(v), set()).add(code)
+    pair = {unit, neighbour}
+    ring = next(
+        r for r in rings(geoms[unit]) if any(owners[tuple(v)] == pair for v in r)
+    )
+    n = len(ring) - 1
+    # Both neighbours on the same border, so only this pair's edges move.
+    border = [
+        k
+        for k in range(n)
+        if all(owners[tuple(ring[(k + d) % n])] >= pair for d in (-1, 0, 1))
+        and owners[tuple(ring[k])] == pair
+    ]
+    k = border[len(border) // 2]
+    (px, py), (qx, qy), (x, y) = ring[(k - 1) % n], ring[(k + 1) % n], ring[k]
+    length = math.hypot(qx - px, qy - py)
+    nx, ny = (py - qy) / length, (qx - px) / length
+    target = neighbour if m > 0 else unit
+    for sign in (1, -1):
+        point = [x + sign * nx * abs(m), y + sign * ny * abs(m)]
+        inside = con.execute(
+            "SELECT ST_Contains(geometry, ST_Point(?, ?)) FROM w WHERE gemeentecode = ?",
+            [*point, target],
+        ).fetchone()[0]
+        if inside:
+            ring[k] = point
+            if k == 0:
+                ring[n] = point
+            return
+    msg = f"{unit}: no side of its border with {neighbour} lies in {target}"
+    raise SystemExit(msg)
+
+
+def topo_input(src: Path, out: Path) -> None:
+    """Every gemeente with its water, as one gap-free coverage, then the DISPLACED vertices."""
+    con = duckdb.connect()
+    con.execute("LOAD spatial")
+    con.execute(
+        "CREATE TABLE w AS SELECT row_number() OVER (ORDER BY gemeentecode) AS i, gemeentecode, "
+        "any_value(gemeentenaam) AS gemeentenaam, ST_Union_Agg(geometry::GEOMETRY) AS geometry "
+        f"FROM read_parquet('{src}') GROUP BY gemeentecode"
+    )
+    simplify(con, "w")
+    geoms = {
+        code: json.loads(g)
+        for code, g in con.execute(
+            "SELECT gemeentecode, ST_AsGeoJSON(geometry) FROM w"
+        ).fetchall()
+    }
+    for unit, neighbour, m in DISPLACED:
+        displace(con, geoms, unit, neighbour, m)
+    con.execute("CREATE TABLE edits (gemeentecode VARCHAR, geojson VARCHAR)")
+    con.executemany(
+        "INSERT INTO edits VALUES (?, ?)",
+        [(unit, json.dumps(geoms[unit])) for unit, _, _ in DISPLACED],
+    )
     copy(
         con,
-        f"""
-        SELECT CASE
-                WHEN o.m IS NOT NULL THEN ST_Buffer(g.geometry::GEOMETRY, o.m)
-                WHEN s.m IS NOT NULL THEN ST_Difference(g.geometry::GEOMETRY, ST_Buffer(n.geometry::GEOMETRY, s.m))
-                ELSE g.geometry::GEOMETRY
-            END::GEOMETRY('EPSG:28992') AS geometry,
-            g.gemeentecode AS adm2_code, g.gemeentenaam AS adm2_name
-        FROM g
-        LEFT JOIN (VALUES {overlaps}) o(code, m) ON o.code = g.gemeentecode
-        LEFT JOIN (VALUES {slivers}) s(code, neighbour, m) ON s.code = g.gemeentecode
-        LEFT JOIN g n ON n.gemeentecode = s.neighbour
-        ORDER BY adm2_code
-        """,
+        "SELECT coalesce(ST_GeomFromGeoJSON(e.geojson), w.geometry::GEOMETRY)::GEOMETRY('EPSG:28992') AS geometry, "
+        "gemeentecode AS adm2_code, gemeentenaam AS adm2_name "
+        "FROM w LEFT JOIN edits e USING (gemeentecode) ORDER BY adm2_code",
         out,
     )
 
@@ -151,11 +213,13 @@ def issue_counts(path: Path, cache: Path) -> dict[str, int]:
     )
 
 
-def check_topo(path: Path, water_gaps: int, cache: Path) -> None:
-    slivers = len(SLIVER_M)
-    counts = issue_counts(path, cache)
-    if counts.get("gap") != water_gaps + slivers or not counts.get("overlap"):
-        msg = f"{path}: {counts}, expected {water_gaps} water and {slivers} sliver gaps plus overlaps"
+def check_topo(path: Path, cache: Path) -> None:
+    expected = {
+        "overlap": sum(m > 0 for *_, m in DISPLACED),
+        "gap": sum(m < 0 for *_, m in DISPLACED),
+    }
+    if (counts := issue_counts(path, cache)) != expected:
+        msg = f"{path}: {counts}, expected {expected}"
         raise SystemExit(msg)
     out = cache / "topo" / "nld_admin2_clean.parquet"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -163,11 +227,11 @@ def check_topo(path: Path, water_gaps: int, cache: Path) -> None:
         path,
         out,
         out.with_stem(out.stem + "_issues"),
-        maximum_gap_width=str(TOPO_GAP_M / METERS_PER_DEGREE),
+        maximum_gap_width="thin",
         tmp_dir=cache / "tmp",
     )
-    if (cleaned := issue_counts(out, cache)) != {"gap": water_gaps}:
-        msg = f"topo-clean at {TOPO_GAP_M} m left {cleaned}, expected only the {water_gaps} water gaps"
+    if cleaned := issue_counts(out, cache):
+        msg = f"topo-clean --maximum-gap-width thin left {cleaned}"
         raise SystemExit(msg)
 
 
@@ -200,7 +264,7 @@ def main() -> None:
     con = gemeenten(src, cached(GEBIEDEN, args.cache / "gebieden_2025.json"))
     schema_map_input(con, raw)
     schema_join_input(con, input_path)
-    topo_input(con, topo_path)
+    topo_input(src, topo_path)
     schema_join_layer(
         cached(PROVINCIEGEBIED, args.cache / "provinciegebied.json"), join_path
     )
@@ -220,7 +284,7 @@ def main() -> None:
     if n := join_issues(input_path, join_path, args.cache):
         msg = f"schema-join reported {n} issues"
         raise SystemExit(msg)
-    check_topo(topo_path, counts[input_path]["gap"], args.cache)
+    check_topo(topo_path, args.cache)
 
 
 if __name__ == "__main__":
