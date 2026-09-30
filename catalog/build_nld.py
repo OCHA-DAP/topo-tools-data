@@ -9,6 +9,7 @@ from itertools import pairwise
 from pathlib import Path
 
 import duckdb
+from outputs import read_state, write_parquet, write_state
 from topo_tools.api.topo_detect import detect
 
 PDOK = "https://service.pdok.nl/cbs/wijkenbuurten"
@@ -49,8 +50,8 @@ def gpkg_link(year: int) -> tuple[str, int]:
     return link.group(1), int(link.group(2))
 
 
-def fetch(year: int, cache: Path, *, refetch: bool) -> Path:
-    url, length = gpkg_link(year)
+def fetch(year: int, link: tuple[str, int], cache: Path, *, refetch: bool) -> Path:
+    url, length = link
     path = cache / f"wijkenbuurten_{year}.gpkg"
     if path.exists() and path.stat().st_size == length and not refetch:
         return path
@@ -146,24 +147,31 @@ def detect_counts(outputs: list[Path], cache: Path) -> dict:
     return report
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--out", type=Path, required=True, help="Catalog root directory"
-    )
-    parser.add_argument("--cache", type=Path, default=Path("tmp/catalog/cache"))
-    parser.add_argument("--refetch", action="store_true")
-    parser.add_argument(
-        "--detect", action="store_true", help="Add topo-detect counts to the report"
-    )
-    args = parser.parse_args()
-    args.cache.mkdir(parents=True, exist_ok=True)
+def outputs(out: Path) -> list[Path]:
+    return [
+        out / "nld" / str(year) / ADMIN[level] / f"{ADMIN[level]}.parquet"
+        for year in YEARS
+        for level in LEVELS
+    ]
+
+
+def build(
+    out: Path, cache: Path, *, refetch: bool = False, detect_issues: bool = False
+) -> bool:
+    """Write every year's layers, skipped when no PDOK GeoPackage changed. Returns True when built."""
+    cache.mkdir(parents=True, exist_ok=True)
+    state_path = out / ".state" / "fingerprints.json"
+    state = read_state(state_path)
+    links = {str(year): list(gpkg_link(year)) for year in YEARS}
+    paths = outputs(out)
+    if not refetch and state.get("nld") == links and all(p.exists() for p in paths):
+        return False
 
     con = duckdb.connect()
     con.execute("LOAD spatial")
-    errors, outputs = [], []
+    errors = []
     for year in YEARS:
-        gpkg = fetch(year, args.cache, refetch=args.refetch)
+        gpkg = fetch(year, tuple(links[str(year)]), cache, refetch=refetch)
         for level in LEVELS:
             con.execute(f"CREATE TABLE {level}_{year} AS {select_sql(level, gpkg)}")
         errors += validate(con, year)
@@ -172,20 +180,32 @@ def main() -> None:
 
     for year in YEARS:
         for level in LEVELS:
-            path = (
-                args.out / "nld" / str(year) / ADMIN[level] / f"{ADMIN[level]}.parquet"
+            write_parquet(
+                con,
+                f"SELECT * FROM {level}_{year} ORDER BY {CODE[level]}, water",
+                out / "nld" / str(year) / ADMIN[level] / f"{ADMIN[level]}.parquet",
             )
-            path.parent.mkdir(parents=True, exist_ok=True)
-            con.execute(
-                f"COPY (SELECT * FROM {level}_{year} ORDER BY {CODE[level]}, water) "
-                f"TO '{path}' (FORMAT parquet, COMPRESSION zstd)"
-            )
-            outputs.append(path)
 
     report = {"churn": churn(con)}
-    if args.detect:
-        report["detect"] = detect_counts(outputs, args.cache)
-    (args.cache.parent / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    if detect_issues:
+        report["detect"] = detect_counts(paths, cache)
+    (cache.parent / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    write_state(state_path, {**state, "nld": links})
+    return True
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--out", type=Path, default=Path("portolan"), help="Catalog root directory"
+    )
+    parser.add_argument("--cache", type=Path, default=Path("tmp/catalog/cache"))
+    parser.add_argument("--refetch", action="store_true")
+    parser.add_argument(
+        "--detect", action="store_true", help="Add topo-detect counts to the report"
+    )
+    args = parser.parse_args()
+    build(args.out, args.cache, refetch=args.refetch, detect_issues=args.detect)
 
 
 if __name__ == "__main__":

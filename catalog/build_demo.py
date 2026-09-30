@@ -7,6 +7,8 @@ from pathlib import Path
 
 import duckdb
 from build_nld import get
+from outputs import copy_parquet, write_parquet
+from topo_tools.api.edge_match import match
 from topo_tools.api.schema_join import join
 from topo_tools.api.schema_map import map as schema_map
 from topo_tools.api.topo_clean import clean
@@ -14,6 +16,8 @@ from topo_tools.api.topo_detect import detect
 
 SIMPLIFY_M = 100.0
 SNAP_M = 0.01
+# CBS land/water slivers; each one seeds a Voronoi wedge in edge-match.
+CRUMB_M2 = 10_000.0
 # (unit, neighbour, metres): one vertex on their shared border moves into the neighbour
 # (positive, an overlap) or back into the unit (negative, a gap).
 DISPLACED = [
@@ -79,8 +83,7 @@ def gemeenten(src: Path, provinces: Path) -> duckdb.DuckDBPyConnection:
 
 
 def copy(con: duckdb.DuckDBPyConnection, query: str, out: Path) -> None:
-    out.parent.mkdir(parents=True, exist_ok=True)
-    con.execute(f"COPY ({query}) TO '{out}' (FORMAT parquet, COMPRESSION zstd)")
+    write_parquet(con, query, out)
 
 
 def schema_map_input(con: duckdb.DuckDBPyConnection, out: Path) -> None:
@@ -113,6 +116,27 @@ def schema_join_layer(provinciegebied: Path, out: Path) -> None:
     copy(
         con,
         "SELECT geometry, identificatie AS adm1_code, naam AS adm1_name FROM t ORDER BY adm1_code",
+        out,
+    )
+
+
+def edge_input(con: duckdb.DuckDBPyConnection, out: Path) -> None:
+    con.execute(f"""
+        CREATE OR REPLACE TABLE e AS
+        SELECT gemeentecode, gemeentenaam, ST_Union_Agg(d.geom) AS geometry
+        FROM (SELECT gemeentecode, gemeentenaam, unnest(ST_Dump(geometry::GEOMETRY)) AS d FROM g)
+        WHERE ST_Area(d.geom) >= {CRUMB_M2}
+        GROUP BY ALL
+    """)
+    if missing := con.execute(
+        "SELECT count(*) FROM g ANTI JOIN e USING (gemeentecode)"
+    ).fetchone()[0]:
+        msg = f"{missing} gemeenten have no part of {CRUMB_M2:g} m² or more"
+        raise SystemExit(msg)
+    copy(
+        con,
+        "SELECT geometry::GEOMETRY('EPSG:28992') AS geometry, gemeentecode AS adm2_code, gemeentenaam AS adm2_name "
+        "FROM e ORDER BY adm2_code",
         out,
     )
 
@@ -235,6 +259,23 @@ def check_topo(path: Path, cache: Path) -> None:
         raise SystemExit(msg)
 
 
+def check_edge(
+    input_path: Path, overlay_path: Path, overlay_gaps: int, cache: Path
+) -> None:
+    out = cache / "edge" / "nld_admin2_matched.parquet"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    match(input_path, overlay_path, out, per_feature=True, tmp_dir=cache / "tmp")
+    kinds = dict(
+        duckdb.sql(
+            f"SELECT kind, count(*) FROM read_parquet('{out.with_stem(out.stem + '_issues')}') "
+            "WHERE kind <> 'micro-polygon' GROUP BY kind"
+        ).fetchall()
+    )
+    if kinds != {"gap": overlay_gaps}:
+        msg = f"edge-match --per-feature reported {kinds}, expected only the overlay's {overlay_gaps} gaps"
+        raise SystemExit(msg)
+
+
 def join_issues(input_path: Path, join_path: Path, cache: Path) -> int:
     out = cache / "schema-join" / "nld_admin2_join.parquet"
     join(input_path, join_path, out, tmp_dir=cache / "tmp")
@@ -244,33 +285,26 @@ def join_issues(input_path: Path, join_path: Path, cache: Path) -> int:
     return duckdb.sql(f"SELECT count(*) FROM read_parquet('{issues}')").fetchone()[0]
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--catalog", type=Path, required=True, help="Catalog root directory"
-    )
-    parser.add_argument("--cache", type=Path, default=Path("tmp/catalog/cache/demo"))
-    args = parser.parse_args()
-    args.cache.mkdir(parents=True, exist_ok=True)
-
-    src = args.catalog / "nld" / "2025" / "nld_admin2" / "nld_admin2.parquet"
-    demo = args.catalog / "nld" / "demo"
+def build(catalog: Path, cache: Path) -> None:
+    cache.mkdir(parents=True, exist_ok=True)
+    src = catalog / "nld" / "2025" / "nld_admin2" / "nld_admin2.parquet"
+    demo = catalog / "nld" / "demo"
     raw = demo / "schema-map" / "nld_admin2.parquet"
     input_path = demo / "schema-join" / "nld_admin2.parquet"
     join_path = demo / "schema-join" / "nld_admin1.parquet"
     topo_path = demo / "topo" / "nld_admin2.parquet"
-    mapped = args.cache / "schema-map" / "nld_admin2_mapped.parquet"
+    edge_path = demo / "edge" / "nld_admin2.parquet"
+    mapped = cache / "schema-map" / "nld_admin2_mapped.parquet"
 
-    con = gemeenten(src, cached(GEBIEDEN, args.cache / "gebieden_2025.json"))
+    con = gemeenten(src, cached(GEBIEDEN, cache / "gebieden_2025.json"))
     schema_map_input(con, raw)
     schema_join_input(con, input_path)
     topo_input(src, topo_path)
+    edge_input(con, edge_path)
     schema_join_layer(
-        cached(PROVINCIEGEBIED, args.cache / "provinciegebied.json"), join_path
+        cached(PROVINCIEGEBIED, cache / "provinciegebied.json"), join_path
     )
-    counts = {
-        path: issue_counts(path, args.cache) for path in (raw, input_path, join_path)
-    }
+    counts = {path: issue_counts(path, cache) for path in (raw, input_path, join_path)}
     for path, kinds in counts.items():
         if n := kinds.get("overlap", 0):
             msg = f"{path}: {n} overlaps after simplify and clean"
@@ -279,12 +313,25 @@ def main() -> None:
         raw,
         mapped,
         csv_output=mapped.with_name("nld_admin2_crosswalk.csv"),
-        tmp_dir=args.cache / "tmp",
+        tmp_dir=cache / "tmp",
     )
-    if n := join_issues(input_path, join_path, args.cache):
+    if n := join_issues(input_path, join_path, cache):
         msg = f"schema-join reported {n} issues"
         raise SystemExit(msg)
-    check_topo(topo_path, args.cache)
+    check_topo(topo_path, cache)
+    edge_overlay = edge_path.with_stem("nld_admin1")
+    copy_parquet(join_path, edge_overlay)
+    check_edge(edge_path, edge_overlay, counts[join_path]["gap"], cache)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--catalog", type=Path, default=Path("portolan"), help="Catalog root directory"
+    )
+    parser.add_argument("--cache", type=Path, default=Path("tmp/catalog/cache/demo"))
+    args = parser.parse_args()
+    build(args.catalog, args.cache)
 
 
 if __name__ == "__main__":

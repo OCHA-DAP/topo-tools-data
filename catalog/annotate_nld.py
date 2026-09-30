@@ -9,7 +9,7 @@ from pathlib import Path
 
 import duckdb
 import yaml
-from build_demo import DISPLACED
+from build_demo import CRUMB_M2, DISPLACED
 from build_nld import ADMIN, YEARS, dataset_feed
 
 LEVEL = {admin: level for level, admin in ADMIN.items()}
@@ -77,6 +77,21 @@ DEMO = {
         ],
         "processing_notes": "Built by `catalog/build_demo.py` in [topo-tools-data](https://github.com/OCHA-DAP/topo-tools-data): gemeenten from the land rows of `nld/2025/nld_admin2`, and provincies from the PDOK [Bestuurlijke Gebieden OGC API](https://api.pdok.nl/kadaster/bestuurlijkegebieden/ogc/v1) (`provinciegebied`, retrieved 2026-09-28). Each layer is simplified with `ST_CoverageSimplify` at 100 m, then `ST_CoverageClean` with 0.01 m snapping and no gap filling.",
     },
+}
+DEMO["edge"] = {
+    "title": "Gemeenten and provincies 2025 for edge-match",
+    "description": "An input and an overlay layer for edge-match, in EPSG:28992, simplified to 100 m. `nld_admin2.parquet` has the 342 land gemeenten from the CBS Wijk- en Buurtkaart 2025, with `adm2_code` and `adm2_name`. `nld_admin1.parquet` has the 12 provincies from Kadaster Bestuurlijke Gebieden, which include water, with `adm1_code` and `adm1_name`. Running edge-match with per-feature fitting extends the gemeenten over the water until they fill their provincies. See [AGENTS.md](AGENTS.md).",
+    "keywords": [
+        "administrative boundaries",
+        "Netherlands",
+        "CBS",
+        "Kadaster",
+        "gemeenten",
+        "provincies",
+        "topo-tools",
+        "edge-match",
+    ],
+    "processing_notes": "Built by `catalog/build_demo.py` in [topo-tools-data](https://github.com/OCHA-DAP/topo-tools-data) from the same simplified layers as `schema-join`. Gemeente parts under 1 ha, slivers from the CBS land/water split, are dropped.",
 }
 DEMO["topo"] = {
     "title": "Gemeenten 2025 with digitization errors",
@@ -193,7 +208,21 @@ def cached_pdf(url: str, cache: Path) -> Path:
     return path
 
 
-def extra_assets(year: int, cache: Path) -> dict:
+def gpkg_fields(year: int, href: str, cache: Path, collection_dir: Path) -> dict:
+    """Checksum the cached GeoPackage, or reuse the one recorded for the same href when it isn't cached."""
+    path = cache / f"wijkenbuurten_{year}.gpkg"
+    if path.exists():
+        return file_fields(path)
+    source = json.loads((collection_dir / "collection.json").read_text())["assets"].get(
+        "source", {}
+    )
+    if source.get("href") != href:
+        msg = f"{path} is missing and {collection_dir} records no source for {href}"
+        raise SystemExit(msg)
+    return {key: source[key] for key in ("file:size", "file:checksum")}
+
+
+def extra_assets(year: int, cache: Path, collection_dir: Path) -> dict:
     feed = dataset_feed(year)
     gpkg = re.search(r'<link href="([^"]+\.gpkg)"', feed).group(1)
     iso = re.search(r'<link href="([^"]+GetRecordById[^"]+)"', feed).group(1)
@@ -203,7 +232,7 @@ def extra_assets(year: int, cache: Path) -> dict:
             "type": "application/geopackage+sqlite3",
             "roles": ["source"],
             "title": f"Wijk- en Buurtkaart {year} GeoPackage, PDOK Atom download",
-            **file_fields(cache / f"wijkenbuurten_{year}.gpkg"),
+            **gpkg_fields(year, gpkg, cache, collection_dir),
         },
         "iso-19115": {
             "href": iso.replace("&amp;", "&"),
@@ -479,6 +508,30 @@ def annotate_schema_join(collection_dir: Path) -> None:
     )
 
 
+def annotate_edge(collection_dir: Path, cache: Path) -> None:
+    join_style(collection_dir)
+    demo_collection(collection_dir, JOIN_COLUMNS)
+    url = f"{DATA}/nld/demo/edge"
+    rows = duckdb.execute(
+        f"SELECT count(*) FROM read_parquet('{collection_dir / 'nld_admin2.parquet'}')"
+    ).fetchone()[0]
+    gaps = duckdb.execute(
+        f"SELECT count(*) FROM read_parquet('{cache / 'edge' / 'nld_admin2_matched_issues.parquet'}') WHERE kind = 'gap'"
+    ).fetchone()[0]
+    (collection_dir / "AGENTS.md").write_text(
+        template(
+            "demo_edge",
+            title=DEMO["edge"]["title"],
+            rows=str(rows),
+            input=f"{url}/nld_admin2.parquet",
+            overlay=f"{url}/nld_admin1.parquet",
+            gaps=str(gaps),
+            crumb_ha=f"{CRUMB_M2 / 10_000:g}",
+            web=WEB,
+        )
+    )
+
+
 def annotate_topo(collection_dir: Path, cache: Path) -> None:
     demo_collection(collection_dir, TOPO_COLUMNS)
     url = f"{DATA}/nld/demo/topo/nld_admin2.parquet"
@@ -529,21 +582,11 @@ def apply_titles(catalog: Path) -> None:
                 )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--catalog", type=Path, required=True, help="Catalog root directory"
-    )
-    parser.add_argument("--cache", type=Path, default=Path("tmp/catalog/cache"))
-    parser.add_argument(
-        "--metadata-only",
-        action="store_true",
-        help="Write metadata.yaml files only (run before `portolan add`)",
-    )
-    args = parser.parse_args()
-
+def annotate_catalog(
+    catalog: Path, cache: Path, *, metadata_only: bool = False
+) -> None:
     for year in YEARS:
-        year_dir = args.catalog / "nld" / str(year)
+        year_dir = catalog / "nld" / str(year)
         write_yaml(
             year_dir / ".portolan" / "metadata.yaml",
             {
@@ -551,7 +594,11 @@ def main() -> None:
                 "description": f"CBS Wijk- en Buurtkaart {year}: gemeenten (admin2), wijken (admin3) and buurten (admin4).",
             },
         )
-        assets = None if args.metadata_only else extra_assets(year, args.cache)
+        assets = (
+            None
+            if metadata_only
+            else extra_assets(year, cache, year_dir / "nld_admin2")
+        )
         for admin in LEVEL:
             collection_dir = year_dir / admin
             write_yaml(
@@ -560,18 +607,34 @@ def main() -> None:
             )
             if assets is not None:
                 annotate(collection_dir, admin, year, assets)
-    demo = args.catalog / "nld" / "demo"
+    demo = catalog / "nld" / "demo"
     for path, fields in DEMO.items():
         if (demo / path).exists():
             write_yaml(demo / path / ".portolan" / "metadata.yaml", fields)
-    if not args.metadata_only:
-        apply_titles(args.catalog)
-        write_agents(args.catalog)
+    if not metadata_only:
+        apply_titles(catalog)
+        write_agents(catalog)
         if demo.exists():
             (demo / "AGENTS.md").write_text(template("demo"))
-            annotate_schema_map(demo / "schema-map", args.cache / "demo")
+            annotate_schema_map(demo / "schema-map", cache / "demo")
             annotate_schema_join(demo / "schema-join")
-            annotate_topo(demo / "topo", args.cache / "demo")
+            annotate_topo(demo / "topo", cache / "demo")
+            annotate_edge(demo / "edge", cache / "demo")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--catalog", type=Path, default=Path("portolan"), help="Catalog root directory"
+    )
+    parser.add_argument("--cache", type=Path, default=Path("tmp/catalog/cache"))
+    parser.add_argument(
+        "--metadata-only",
+        action="store_true",
+        help="Write metadata.yaml files only (run before `portolan add`)",
+    )
+    args = parser.parse_args()
+    annotate_catalog(args.catalog, args.cache, metadata_only=args.metadata_only)
 
 
 if __name__ == "__main__":
