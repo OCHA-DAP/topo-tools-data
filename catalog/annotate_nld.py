@@ -9,7 +9,7 @@ from pathlib import Path
 
 import duckdb
 import yaml
-from build_demo import CRUMB_M2, DISPLACED
+from build_demo import CRUMB_M2, DISPLACED, NAME_FIXES, NAMES
 from build_nld import ADMIN, YEARS, dataset_feed
 
 LEVEL = {admin: level for level, admin in ADMIN.items()}
@@ -107,6 +107,49 @@ DEMO["topo"] = {
     ],
     "processing_notes": "Built by `catalog/build_demo.py` in [topo-tools-data](https://github.com/OCHA-DAP/topo-tools-data) from `nld/2025/nld_admin2`: land and water rows unioned per `gemeentecode`, `ST_CoverageSimplify` at 100 m, then `ST_CoverageClean` with 0.01 m snapping and no gap filling. One vertex on each of five shared borders is then moved perpendicular to the border, into the neighbour for an overlap or back into the gemeente for a gap.",
 }
+DEMO["code"] = {
+    "title": "Gemeenten 2022 and 2023 for code-update",
+    "description": "An old and a new layer for code-update, in EPSG:28992, simplified to 100 m. `nld_admin2_2022.parquet` has the 345 land gemeenten from the CBS Wijk- en Buurtkaart 2022, coded by code-create from root `NL`. `nld_admin2_2023.parquet` has the 342 land gemeenten of 2023 with only their CBS and Kadaster codes. Running code-update carries the 2022 codes forward: two mergers retire 5 codes and create 2, and the other 340 gemeenten keep theirs. See [AGENTS.md](AGENTS.md).",
+    "keywords": [
+        "administrative boundaries",
+        "Netherlands",
+        "CBS",
+        "Kadaster",
+        "gemeenten",
+        "topo-tools",
+        "code-update",
+    ],
+    "processing_notes": "Built by `catalog/build_demo.py` in [topo-tools-data](https://github.com/OCHA-DAP/topo-tools-data) from the land rows of `nld/2022/nld_admin2` and `nld/2023/nld_admin2`, each simplified like `schema-join`, with adm1 added by schema-join against the `schema-join` provincies and adm0 set to `NL`. The 2022 layer is then coded by `code-create` with root `NL`, no delimiter and 2-digit parts, keeping the source codes as `adm1_code1` and `adm2_code1`.",
+}
+DEMO["names"] = {
+    "title": "Gemeenten 2025 with name errors",
+    "description": "The `package` layer with six gemeente names edited, in EPSG:28992. Each edit is one kind of name-detect finding: an encoding artifact, decomposed accents, a double space, non-breaking spaces, a name in capitals and a case-variant duplicate. Running name-detect reports all six. Running name-clean fixes the first four and leaves the other two for review. See [AGENTS.md](AGENTS.md).",
+    "keywords": [
+        "administrative boundaries",
+        "Netherlands",
+        "CBS",
+        "gemeenten",
+        "topo-tools",
+        "name-detect",
+        "name-clean",
+    ],
+    "processing_notes": "Built by `catalog/build_demo.py` in [topo-tools-data](https://github.com/OCHA-DAP/topo-tools-data) from `package/nld_admin2.parquet`, with the `adm2_name` of six gemeenten replaced as listed in AGENTS.md.",
+}
+DEMO["package"] = {
+    "title": "Gemeenten 2025 for package",
+    "description": "The 342 gemeenten from the `edge` demo after edge-match, filling their provincies including water, in EPSG:28992. Each carries adm0 `NL`, its provincie as adm1 from Kadaster and its CBS code and name as adm2. Running package writes country, provincie and gemeente polygons, one point per unit and the boundary lines. See [AGENTS.md](AGENTS.md).",
+    "keywords": [
+        "administrative boundaries",
+        "Netherlands",
+        "CBS",
+        "Kadaster",
+        "gemeenten",
+        "provincies",
+        "topo-tools",
+        "package",
+    ],
+    "processing_notes": "Built by `catalog/build_demo.py` in [topo-tools-data](https://github.com/OCHA-DAP/topo-tools-data): `edge-match --per-feature` on the `edge` demo, then schema-join against the `schema-join` provincies for adm1, and adm0 set to `NL`.",
+}
 for fields in DEMO.values():
     fields.setdefault(
         "keywords", ["administrative boundaries", "Netherlands", "CBS", "topo-tools"]
@@ -134,6 +177,32 @@ TOPO_COLUMNS = {
     "adm2_name": JOIN_COLUMNS["adm2_name"],
     "bbox": COLUMNS["bbox"],
 }
+HIERARCHY_COLUMNS = {
+    "geometry": "Polygon or MultiPolygon in EPSG:28992 (RD New, metres), simplified to 100 m with `ST_CoverageSimplify` so neighbours keep shared edges.",
+    "adm0_code": "Country code, always `NL`.",
+    "adm0_name": "Country name, always `Nederland`.",
+    "adm1_code": JOIN_COLUMNS["adm1_code"],
+    "adm1_name": JOIN_COLUMNS["adm1_name"],
+    "adm2_code": JOIN_COLUMNS["adm2_code"],
+    "adm2_name": JOIN_COLUMNS["adm2_name"],
+    "bbox": COLUMNS["bbox"],
+}
+CODE_COLUMNS = {
+    **HIERARCHY_COLUMNS,
+    "adm0_code": "Country code, always `NL`, the code-create root in the 2022 layer.",
+    "adm1_code": "Provincie code. 2022: `NL` plus 2 digits, from code-create. 2023: `PV` plus 2 digits, from Kadaster.",
+    "adm2_code": "Gemeente code. 2022: its provincie's code plus 2 digits, from code-create. 2023: `GM` plus 4 digits, from CBS.",
+    "adm1_code1": "2022 only: the Kadaster provincie code (`PV` plus 2 digits) that code-create replaced.",
+    "adm2_code1": "2022 only: the CBS gemeente code (`GM` plus 4 digits) that code-create replaced.",
+}
+NAMES_COLUMNS = {
+    **HIERARCHY_COLUMNS,
+    "adm2_name": "Official gemeente name, from CBS, with the edits listed in AGENTS.md.",
+}
+PACKAGE_COLUMNS = {
+    **HIERARCHY_COLUMNS,
+    "geometry": "Polygon or MultiPolygon in EPSG:28992 (RD New, metres), the edge-match output: gemeenten extended over water to fill their provincies.",
+}
 PROVINCIES = {
     "Groningen": "#a6cee3",
     "Fryslân": "#1f78b4",
@@ -150,7 +219,7 @@ PROVINCIES = {
 }
 
 DATA = "https://data.source.coop/hdx/topo-tools"
-WEB = "https://ocha-dap.github.io/topo-tools-js"
+WEB = "https://topo-tools.org"
 TEMPLATES = Path(__file__).parent / "agents"
 REVISION = {2021: 3, 2022: 3, 2023: 3, 2024: 2, 2025: 1}
 UNIT = {
@@ -362,13 +431,17 @@ def write_agents(catalog: Path) -> None:
             )
 
 
-def demo_collection(collection_dir: Path, columns: dict) -> None:
+def demo_collection(
+    collection_dir: Path, columns: dict, years: tuple[int, int] = (2025, 2025)
+) -> None:
     path = collection_dir / "collection.json"
     collection = json.loads(path.read_text())
     for column in collection["table:columns"]:
         if column["name"] in columns:
             column["description"] = columns[column["name"]]
-    collection["extent"]["temporal"]["interval"] = [["2025-01-01T00:00:00Z"] * 2]
+    collection["extent"]["temporal"]["interval"] = [
+        [f"{year}-01-01T00:00:00Z" for year in years]
+    ]
     for asset in collection["assets"].values():
         local = collection_dir / asset["href"]
         if "://" not in asset["href"] and local.exists():
@@ -566,6 +639,84 @@ def annotate_topo(collection_dir: Path, cache: Path) -> None:
     )
 
 
+def annotate_code(collection_dir: Path, cache: Path) -> None:
+    demo_collection(collection_dir, CODE_COLUMNS, (2022, 2023))
+    url = f"{DATA}/nld/demo/code"
+    old_rows, new_rows = (
+        duckdb.execute(
+            f"SELECT count(*) FROM read_parquet('{collection_dir / f'nld_admin2_{year}.parquet'}')"
+        ).fetchone()[0]
+        for year in (2022, 2023)
+    )
+    outcomes = dict(
+        duckdb.execute(
+            f"SELECT code_outcome, count(*) FROM read_csv('{cache / 'code' / 'nld_admin2_changelog.csv'}') "
+            "WHERE level = 2 GROUP BY 1"
+        ).fetchall()
+    )
+    (collection_dir / "AGENTS.md").write_text(
+        template(
+            "demo_code",
+            title=DEMO["code"]["title"],
+            old_rows=str(old_rows),
+            new_rows=str(new_rows),
+            old=f"{url}/nld_admin2_2022.parquet",
+            new=f"{url}/nld_admin2_2023.parquet",
+            retired=str(outcomes["retired"]),
+            created=str(outcomes["new"]),
+            retained=str(outcomes["retained"]),
+            web=WEB,
+        )
+    )
+
+
+def annotate_names(collection_dir: Path) -> None:
+    demo_collection(collection_dir, NAMES_COLUMNS)
+    url = f"{DATA}/nld/demo/names/nld_admin2.parquet"
+    (collection_dir / "AGENTS.md").write_text(
+        template(
+            "demo_names",
+            title=DEMO["names"]["title"],
+            rows=str(
+                duckdb.execute(
+                    f"SELECT count(*) FROM read_parquet('{collection_dir / 'nld_admin2.parquet'}')"
+                ).fetchone()[0]
+            ),
+            edits="\n".join(
+                f"| {code} | {name} | `{ascii(stored)[1:-1]}` | `{kind}` | {'yes' if kind in NAME_FIXES else 'no'} |"
+                for code, name, stored, kind in NAMES
+            ),
+            url=url,
+            web=WEB,
+        )
+    )
+
+
+def annotate_package(collection_dir: Path, cache: Path) -> None:
+    demo_collection(collection_dir, PACKAGE_COLUMNS)
+    url = f"{DATA}/nld/demo/package/nld_admin2.parquet"
+    out = cache / "package"
+
+    def count(name: str) -> int:
+        return duckdb.execute(
+            f"SELECT count(*) FROM read_parquet('{out / name}')"
+        ).fetchone()[0]
+
+    (collection_dir / "AGENTS.md").write_text(
+        template(
+            "demo_package",
+            title=DEMO["package"]["title"],
+            rows=str(count("nld_admin2.parquet")),
+            provincies=str(count("nld_admin1.parquet")),
+            points=str(count("nld_points.parquet")),
+            lines=str(count("nld_lines.parquet")),
+            gaps=str(count("nld_admin2_issues.parquet")),
+            url=url,
+            web=WEB,
+        )
+    )
+
+
 def apply_titles(catalog: Path) -> None:
     for metadata in catalog.rglob(".portolan/metadata.yaml"):
         fields = yaml.safe_load(metadata.read_text()) or {}
@@ -620,6 +771,9 @@ def annotate_catalog(
             annotate_schema_join(demo / "schema-join")
             annotate_topo(demo / "topo", cache / "demo")
             annotate_edge(demo / "edge", cache / "demo")
+            annotate_code(demo / "code", cache / "demo")
+            annotate_names(demo / "names")
+            annotate_package(demo / "package", cache / "demo")
 
 
 def main() -> None:

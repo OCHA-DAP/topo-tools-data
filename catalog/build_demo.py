@@ -3,12 +3,17 @@
 import argparse
 import json
 import math
+import unicodedata
 from pathlib import Path
 
 import duckdb
 from build_nld import get
 from outputs import copy_parquet, write_parquet
+from topo_tools.api.code_create import code_create
+from topo_tools.api.code_update import code_update
 from topo_tools.api.edge_match import match
+from topo_tools.api.name_clean import clean as name_clean
+from topo_tools.api.package import package
 from topo_tools.api.schema_join import join
 from topo_tools.api.schema_map import map as schema_map
 from topo_tools.api.topo_clean import clean
@@ -27,6 +32,41 @@ DISPLACED = [
     ("GM0772", "GM0861", -15.0),
     ("GM0014", "GM1966", -25.0),
 ]
+# (code, name, stored name, finding): one of each kind name-detect reports.
+NAMES = [
+    (
+        "GM1900",
+        "Súdwest-Fryslân",
+        "Súdwest-Fryslân".encode().decode("cp1252"),
+        "encoding-artifact",
+    ),
+    (
+        "GM1970",
+        "Noardeast-Fryslân",
+        unicodedata.normalize("NFD", "Noardeast-Fryslân"),
+        "unnormalized-unicode",
+    ),
+    ("GM0484", "Alphen aan den Rijn", "Alphen aan den  Rijn", "whitespace"),
+    (
+        "GM0502",
+        "Capelle aan den IJssel",
+        "Capelle\u00a0aan\u00a0den\u00a0IJssel",
+        "invisible-character",
+    ),
+    ("GM0599", "Rotterdam", "ROTTERDAM", "case-outlier"),
+    (
+        "GM0352",
+        "Wijk bij Duurstede",
+        "Utrechtse heuvelrug",
+        "normalized-duplicate-name",
+    ),
+]
+NAME_FIXES = {
+    "encoding-artifact",
+    "unnormalized-unicode",
+    "whitespace",
+    "invisible-character",
+}
 # CBS StatLine "Gebieden in Nederland 2025"; Code_28/Naam_29 are its Provincies group.
 GEBIEDEN = "https://opendata.cbs.nl/ODataApi/odata/86059NED/TypedDataSet?$format=json&$select=RegioS,Code_28,Naam_29"
 PROVINCIEGEBIED = "https://api.pdok.nl/kadaster/bestuurlijkegebieden/ogc/v1/collections/provinciegebied/items?f=json&limit=100&crs=http://www.opengis.net/def/crs/EPSG/0/28992"
@@ -268,7 +308,7 @@ def check_edge(
     kinds = dict(
         duckdb.sql(
             f"SELECT kind, count(*) FROM read_parquet('{out.with_stem(out.stem + '_issues')}') "
-            "WHERE kind <> 'micro-polygon' GROUP BY kind"
+            "WHERE kind NOT IN ('micro-polygon', 'detached-part') GROUP BY kind"
         ).fetchall()
     )
     if kinds != {"gap": overlay_gaps}:
@@ -283,6 +323,125 @@ def join_issues(input_path: Path, join_path: Path, cache: Path) -> int:
     if not issues.exists():
         return 0
     return duckdb.sql(f"SELECT count(*) FROM read_parquet('{issues}')").fetchone()[0]
+
+
+def hierarchy(src: Path, join_path: Path, out: Path, cache: Path) -> None:
+    """`src`'s adm2 columns under adm0 NL and the provincie layer's adm1, via schema-join."""
+    joined = cache / "hierarchy" / f"{out.parent.name}_{out.name}"
+    joined.parent.mkdir(parents=True, exist_ok=True)
+    join(src, join_path, joined, tmp_dir=cache / "tmp")
+    con = duckdb.connect()
+    con.execute("LOAD spatial")
+    copy(
+        con,
+        "SELECT geometry, 'NL' AS adm0_code, 'Nederland' AS adm0_name, adm1_code, adm1_name, "
+        f"adm2_code, adm2_name FROM read_parquet('{joined}') ORDER BY adm2_code",
+        out,
+    )
+
+
+def code_inputs(
+    catalog: Path, join_path: Path, old: Path, new: Path, cache: Path
+) -> None:
+    """Old year coded from the root by code-create, new year with only its CBS codes."""
+    for year, out in (
+        (2022, cache / "code" / "nld_admin2_2022_cbs.parquet"),
+        (2023, new),
+    ):
+        out.parent.mkdir(parents=True, exist_ok=True)
+        con = duckdb.connect()
+        con.execute("LOAD spatial")
+        con.execute(
+            "CREATE TABLE t AS SELECT row_number() OVER (ORDER BY gemeentecode) AS i, geometry, gemeentecode, gemeentenaam "
+            f"FROM read_parquet('{catalog / 'nld' / str(year) / 'nld_admin2' / 'nld_admin2.parquet'}') WHERE water = 'NEE'"
+        )
+        simplify(con, "t")
+        land = cache / "code" / f"nld_admin2_{year}_land.parquet"
+        copy(
+            con,
+            "SELECT geometry, gemeentecode AS adm2_code, gemeentenaam AS adm2_name FROM t ORDER BY adm2_code",
+            land,
+        )
+        hierarchy(land, join_path, out, cache)
+    code_create(
+        cache / "code" / "nld_admin2_2022_cbs.parquet",
+        old,
+        root_code="NL",
+        delimiter="",
+        min_width=2,
+        source_codes="copy",
+        tmp_dir=cache / "tmp",
+    )
+
+
+def names_input(src: Path, out: Path) -> None:
+    con = duckdb.connect()
+    con.execute("LOAD spatial")
+    con.execute(f"CREATE TABLE t AS SELECT * FROM read_parquet('{src}')")
+    for code, name, defect, _ in NAMES:
+        found = con.execute(
+            "SELECT adm2_name FROM t WHERE adm2_code = ?", [code]
+        ).fetchone()
+        if found != (name,):
+            msg = f"{code}: expected {name!r}, found {found}"
+            raise SystemExit(msg)
+        con.execute("UPDATE t SET adm2_name = ? WHERE adm2_code = ?", [defect, code])
+    copy(con, "SELECT * FROM t ORDER BY adm2_code", out)
+
+
+def check_code(old: Path, new: Path, cache: Path) -> None:
+    out = cache / "code" / "nld_admin2_2023_coded.parquet"
+    changelog = cache / "code" / "nld_admin2_changelog.csv"
+    code_update(old, new, out, changelog, tmp_dir=cache / "tmp")
+    outcomes = dict(
+        duckdb.sql(
+            f"SELECT code_outcome, count(*) FROM read_csv('{changelog}') WHERE level = 2 GROUP BY 1"
+        ).fetchall()
+    )
+    expected = {"retained": 340, "retired": 5, "new": 2}
+    if outcomes != expected:
+        msg = f"code-update adm2 outcomes {outcomes}, expected {expected}"
+        raise SystemExit(msg)
+
+
+def check_names(path: Path, cache: Path) -> None:
+    out = cache / "names" / "nld_admin2_clean.parquet"
+    issues = out.with_name("nld_admin2_clean_issues.csv")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    name_clean(path, out, issues, tmp_dir=cache / "tmp")
+    found = duckdb.sql(
+        f"SELECT code_a, kind, fixed FROM read_csv('{issues}') ORDER BY ALL"
+    ).fetchall()
+    expected = sorted((code, kind, kind in NAME_FIXES) for code, _, _, kind in NAMES)
+    if found != expected:
+        msg = f"name-clean reported {found}, expected {expected}"
+        raise SystemExit(msg)
+    names = dict(
+        duckdb.sql(f"SELECT adm2_code, adm2_name FROM read_parquet('{out}')").fetchall()
+    )
+    if wrong := [
+        code
+        for code, name, _, kind in NAMES
+        if kind in NAME_FIXES and names[code] != name
+    ]:
+        msg = f"name-clean did not restore {wrong}"
+        raise SystemExit(msg)
+
+
+def check_package(path: Path, cache: Path) -> None:
+    out = cache / "package" / "nld_{x}.parquet"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    package(path, out, "adm{n}_name", "adm{n}_code", tmp_dir=cache / "tmp")
+    expected = {"admin0": 1, "admin1": 12, "admin2": 342, "points": 355}
+    counts = {
+        x: duckdb.sql(
+            f"SELECT count(*) FROM read_parquet('{str(out).replace('{x}', x)}')"
+        ).fetchone()[0]
+        for x in expected
+    }
+    if counts != expected:
+        msg = f"package wrote {counts}, expected {expected}"
+        raise SystemExit(msg)
 
 
 def build(catalog: Path, cache: Path) -> None:
@@ -322,6 +481,19 @@ def build(catalog: Path, cache: Path) -> None:
     edge_overlay = edge_path.with_stem("nld_admin1")
     copy_parquet(join_path, edge_overlay)
     check_edge(edge_path, edge_overlay, counts[join_path]["gap"], cache)
+
+    old, new = (
+        demo / "code" / "nld_admin2_2022.parquet",
+        demo / "code" / "nld_admin2_2023.parquet",
+    )
+    code_inputs(catalog, join_path, old, new, cache)
+    check_code(old, new, cache)
+    release = demo / "package" / "nld_admin2.parquet"
+    hierarchy(cache / "edge" / "nld_admin2_matched.parquet", join_path, release, cache)
+    names_path = demo / "names" / "nld_admin2.parquet"
+    names_input(release, names_path)
+    check_names(names_path, cache)
+    check_package(release, cache)
 
 
 def main() -> None:
