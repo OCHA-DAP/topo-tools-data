@@ -306,7 +306,15 @@ def check_edge(
 ) -> None:
     out = cache / "edge" / "nld_admin2_matched.parquet"
     out.parent.mkdir(parents=True, exist_ok=True)
-    match(input_path, overlay_path, out, per_feature=True, tmp_dir=cache / "tmp")
+    # One thread: multi-threaded edge-match output varies run to run, and package/names build on it.
+    match(
+        input_path,
+        overlay_path,
+        out,
+        per_feature=True,
+        threads=1,
+        tmp_dir=cache / "tmp",
+    )
     kinds = dict(
         duckdb.sql(
             f"SELECT kind, count(*) FROM read_parquet('{out.with_stem(out.stem + '_issues')}') "
@@ -396,7 +404,12 @@ def names_input(src: Path, out: Path) -> None:
             msg = f"{code}: expected {name!r}, found {found}"
             raise SystemExit(msg)
         con.execute("UPDATE t SET adm2_name = ? WHERE adm2_code = ?", [defect, code])
-    copy(con, "SELECT * FROM t ORDER BY adm2_code", out)
+    copy(
+        con,
+        "SELECT geometry, adm0_code, adm0_name, adm1_code, adm1_name, adm2_code, adm2_name "
+        "FROM t ORDER BY adm2_code",
+        out,
+    )
 
 
 def check_code(old: Path, new: Path, cache: Path) -> None:
