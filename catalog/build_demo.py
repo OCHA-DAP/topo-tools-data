@@ -69,6 +69,8 @@ NAME_FIXES = {
 }
 # CBS StatLine "Gebieden in Nederland 2025"; Code_28/Naam_29 are its Provincies group.
 GEBIEDEN = "https://opendata.cbs.nl/ODataApi/odata/86059NED/TypedDataSet?$format=json&$select=RegioS,Code_28,Naam_29"
+# topo-tools writes EPSG:4326; the demos stay in RD New like their sources.
+TO_RD = "ST_Transform(geometry, 'EPSG:4326', 'EPSG:28992', always_xy := true)::GEOMETRY('EPSG:28992') AS geometry"
 PROVINCIEGEBIED = "https://api.pdok.nl/kadaster/bestuurlijkegebieden/ogc/v1/collections/provinciegebied/items?f=json&limit=100&crs=http://www.opengis.net/def/crs/EPSG/0/28992"
 
 
@@ -334,7 +336,7 @@ def hierarchy(src: Path, join_path: Path, out: Path, cache: Path) -> None:
     con.execute("LOAD spatial")
     copy(
         con,
-        "SELECT geometry, 'NL' AS adm0_code, 'Nederland' AS adm0_name, adm1_code, adm1_name, "
+        f"SELECT {TO_RD}, 'NL' AS adm0_code, 'Nederland' AS adm0_name, adm1_code, adm1_name, "
         f"adm2_code, adm2_name FROM read_parquet('{joined}') ORDER BY adm2_code",
         out,
     )
@@ -363,14 +365,22 @@ def code_inputs(
             land,
         )
         hierarchy(land, join_path, out, cache)
+    coded = cache / "code" / "nld_admin2_2022_coded.parquet"
     code_create(
         cache / "code" / "nld_admin2_2022_cbs.parquet",
-        old,
+        coded,
         root_code="NL",
         delimiter="",
         min_width=2,
         source_codes="copy",
         tmp_dir=cache / "tmp",
+    )
+    con = duckdb.connect()
+    con.execute("LOAD spatial")
+    copy(
+        con,
+        f"SELECT {TO_RD}, * EXCLUDE (geometry) FROM read_parquet('{coded}') ORDER BY adm2_code",
+        old,
     )
 
 
