@@ -74,7 +74,9 @@ TO_RD = "ST_Transform(geometry, 'EPSG:4326', 'EPSG:28992', always_xy := true)::G
 PROVINCIEGEBIED = "https://api.pdok.nl/kadaster/bestuurlijkegebieden/ogc/v1/collections/provinciegebied/items?f=json&limit=100&crs=http://www.opengis.net/def/crs/EPSG/0/28992"
 
 
-def coverage(con: duckdb.DuckDBPyConnection, table: str, call: str) -> None:
+def coverage(
+    con: duckdb.DuckDBPyConnection, table: str, call: str, crs: str = "EPSG:28992"
+) -> None:
     """Replace `table`'s geometry with a coverage function's per-row result, keyed by `i`."""
     con.execute(f"""
         CREATE OR REPLACE TABLE {table} AS
@@ -84,7 +86,7 @@ def coverage(con: duckdb.DuckDBPyConnection, table: str, call: str) -> None:
         ), merged AS (
             SELECT d.path[1] AS i, ST_Union_Agg(d.geom) AS geometry FROM parts GROUP BY 1
         )
-        SELECT t.i, m.geometry::GEOMETRY('EPSG:28992') AS geometry, t.* EXCLUDE (i, geometry)
+        SELECT t.i, m.geometry::GEOMETRY('{crs}') AS geometry, t.* EXCLUDE (i, geometry)
         FROM {table} t JOIN merged m USING (i)
     """)
 

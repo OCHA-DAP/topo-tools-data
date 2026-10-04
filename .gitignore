@@ -3,3 +3,8 @@
 __pycache__/
 tmp/
 /portolan/
+
+# Source comparison extracts: local-only build inputs
+catalog/build_sources.py
+catalog/sources.yaml
+catalog/agents/sources.md
