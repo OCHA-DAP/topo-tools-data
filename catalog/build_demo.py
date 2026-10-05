@@ -8,7 +8,7 @@ from pathlib import Path
 
 import duckdb
 from build_nld import get
-from outputs import copy_parquet, write_parquet
+from outputs import write_parquet
 from topo_tools.api.code_create import code_create
 from topo_tools.api.code_update import code_update
 from topo_tools.api.edge_match import match
@@ -71,6 +71,21 @@ NAME_FIXES = {
 GEBIEDEN = "https://opendata.cbs.nl/ODataApi/odata/86059NED/TypedDataSet?$format=json&$select=RegioS,Code_28,Naam_29"
 # topo-tools writes EPSG:4326; the demos stay in RD New like their sources.
 TO_RD = "ST_Transform(geometry, 'EPSG:4326', 'EPSG:28992', always_xy := true)::GEOMETRY('EPSG:28992') AS geometry"
+# Edge Matcher runs groups in overlay row order: the coast south to north, then the interior back south.
+EDGE_OVERLAY_ORDER = [
+    "PV29",
+    "PV28",
+    "PV27",
+    "PV24",
+    "PV21",
+    "PV20",
+    "PV22",
+    "PV23",
+    "PV25",
+    "PV26",
+    "PV30",
+    "PV31",
+]
 PROVINCIEGEBIED = "https://api.pdok.nl/kadaster/bestuurlijkegebieden/ogc/v1/collections/provinciegebied/items?f=json&limit=100&crs=http://www.opengis.net/def/crs/EPSG/0/28992"
 
 
@@ -182,6 +197,18 @@ def edge_input(con: duckdb.DuckDBPyConnection, out: Path) -> None:
         "SELECT geometry::GEOMETRY('EPSG:28992') AS geometry, gemeentecode AS adm2_code, gemeentenaam AS adm2_name "
         "FROM e ORDER BY adm2_code",
         out,
+    )
+
+
+def edge_overlay(join_path: Path, out: Path) -> None:
+    con = duckdb.connect()
+    con.execute("LOAD spatial")
+    write_parquet(
+        con,
+        "SELECT geometry, adm1_code, adm1_name "
+        f"FROM read_parquet('{join_path}') ORDER BY list_position({EDGE_OVERLAY_ORDER}, adm1_code)",
+        out,
+        ordered=True,
     )
 
 
@@ -503,9 +530,9 @@ def build(catalog: Path, cache: Path) -> None:
         msg = f"schema-join reported {n} issues"
         raise SystemExit(msg)
     check_topo(topo_path, cache)
-    edge_overlay = edge_path.with_stem("nld_admin1")
-    copy_parquet(join_path, edge_overlay)
-    check_edge(edge_path, edge_overlay, counts[join_path]["gap"], cache)
+    edge_overlay_path = edge_path.with_stem("nld_admin1")
+    edge_overlay(join_path, edge_overlay_path)
+    check_edge(edge_path, edge_overlay_path, counts[join_path]["gap"], cache)
 
     old, new = (
         demo / "code" / "nld_admin2_2022.parquet",

@@ -17,29 +17,23 @@ except ModuleNotFoundError:  # gitignored, only on the maintainer's machine
 DEMO_DATETIME = "2025-01-01"
 
 
+def add(catalog: Path, collection: str, datetime: str) -> None:
+    # portolan 0.8.0 fails instead of replacing a tileset older than its parquet.
+    for parquet in (catalog / collection).rglob("*.parquet"):
+        tiles = parquet.with_suffix(".pmtiles")
+        if tiles.exists() and tiles.stat().st_mtime < parquet.stat().st_mtime:
+            tiles.unlink()
+    portolan(["add", collection, "--pmtiles", "--datetime", datetime], cwd=catalog)
+
+
 def add_all(catalog: Path, sources: list[str]) -> None:
     for year in YEARS:
-        portolan(
-            ["add", f"nld/{year}", "--pmtiles", "--datetime", f"{year}-01-01"],
-            cwd=catalog,
-        )
+        add(catalog, f"nld/{year}", f"{year}-01-01")
     for demo in sorted((catalog / "nld" / "demo").iterdir()):
         if (demo / ".portolan").is_dir():
-            portolan(
-                [
-                    "add",
-                    demo.relative_to(catalog).as_posix(),
-                    "--pmtiles",
-                    "--datetime",
-                    DEMO_DATETIME,
-                ],
-                cwd=catalog,
-            )
+            add(catalog, demo.relative_to(catalog).as_posix(), DEMO_DATETIME)
     for collection in sources:
-        portolan(
-            ["add", collection, "--pmtiles", "--datetime", build_sources.DATETIME],
-            cwd=catalog,
-        )
+        add(catalog, collection, build_sources.DATETIME)
 
 
 def main() -> None:
