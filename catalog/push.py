@@ -169,7 +169,7 @@ def push(catalog: Path, remote: str = REMOTE) -> None:
         repair_collections(catalog, remote, incomplete)
         incomplete = find_incomplete_collections(catalog, remote)
     try:
-        portolan(["check", "--verbose"], cwd=catalog)
+        portolan(["check", "--data-scope", "local", "--verbose"], cwd=catalog)
     except CalledProcessError:
         logger.warning("portolan check reported issues (continuing)")
     if incomplete:
