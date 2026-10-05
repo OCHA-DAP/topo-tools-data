@@ -1,6 +1,7 @@
 """Build the hdx/topo-tools NLD demo inputs: one folder per topo-tools tool."""
 
 import argparse
+import itertools
 import json
 import math
 import unicodedata
@@ -23,6 +24,8 @@ SIMPLIFY_M = 100.0
 SNAP_M = 0.01
 # CBS land/water slivers; each one seeds a Voronoi wedge in edge-match.
 CRUMB_M2 = 10_000.0
+# Vlissingen's Sloe harbour parts sit inside Borsele, and their split pier stripes edge-match.
+MAIN_PART_ONLY = ("GM0718",)
 # (unit, neighbour, metres): one vertex on their shared border moves into the neighbour
 # (positive, an overlap) or back into the unit (negative, a gap).
 DISPLACED = [
@@ -32,6 +35,13 @@ DISPLACED = [
     ("GM0772", "GM0861", -15.0),
     ("GM0014", "GM1966", -25.0),
 ]
+# topo-detect also reports these wedges' thin tips as notches.
+DISPLACED_NOTCHES = 9
+# (unit, neighbour): their shared border stops NOTCH_DEPTH_M short of the national border,
+# leaving a NOTCH_MOUTH_M wide wedge that topo-clean closes into a T junction.
+NOTCHED = [("GM0109", "GM0114"), ("GM0153", "GM0168"), ("GM0858", "GM1724")]
+NOTCH_DEPTH_M = 200.0
+NOTCH_MOUTH_M = 10.0
 # (code, name, stored name, finding): one of each kind name-detect reports.
 NAMES = [
     (
@@ -182,9 +192,14 @@ def schema_join_layer(provinciegebied: Path, out: Path) -> None:
 def edge_input(con: duckdb.DuckDBPyConnection, out: Path) -> None:
     con.execute(f"""
         CREATE OR REPLACE TABLE e AS
-        SELECT gemeentecode, gemeentenaam, ST_Union_Agg(d.geom) AS geometry
-        FROM (SELECT gemeentecode, gemeentenaam, unnest(ST_Dump(geometry::GEOMETRY)) AS d FROM g)
-        WHERE ST_Area(d.geom) >= {CRUMB_M2}
+        SELECT gemeentecode, gemeentenaam, ST_Union_Agg(geom) AS geometry
+        FROM (
+            SELECT gemeentecode, gemeentenaam, d.geom,
+                   row_number() OVER (PARTITION BY gemeentecode ORDER BY ST_Area(d.geom) DESC) AS rank
+            FROM (SELECT gemeentecode, gemeentenaam, unnest(ST_Dump(geometry::GEOMETRY)) AS d FROM g)
+        )
+        WHERE ST_Area(geom) >= {CRUMB_M2}
+          AND (rank = 1 OR gemeentecode NOT IN {MAIN_PART_ONLY!r})
         GROUP BY ALL
     """)
     if missing := con.execute(
@@ -264,8 +279,66 @@ def displace(
     raise SystemExit(msg)
 
 
+def vertex_at(geometry: dict, j: tuple) -> list[tuple[list, int]]:
+    return [
+        (ring, k)
+        for ring in rings(geometry)
+        for k in range(len(ring) - 1)
+        if tuple(ring[k]) == j
+    ]
+
+
+def along(j: tuple, q: tuple, m: float) -> list[float]:
+    d = math.dist(j, q)
+    return [j[0] + (q[0] - j[0]) * m / d, j[1] + (q[1] - j[1]) * m / d]
+
+
+def outer_end(
+    geoms: dict[str, dict], edges: dict, code: str, j: tuple, p: tuple
+) -> tuple | None:
+    """Return `code`'s other neighbour of `j`, past `p`, along an edge no other unit has."""
+    ring, k = vertex_at(geoms[code], j)[0]
+    n = len(ring) - 1
+    sides = {tuple(ring[(k - 1) % n]), tuple(ring[(k + 1) % n])} - {p}
+    return next((q for q in sides if edges[frozenset((j, q))] == {code}), None)
+
+
+def junction(
+    geoms: dict[str, dict], pair: set[str]
+) -> tuple[tuple, tuple, dict[str, tuple]]:
+    """Find a vertex `j` where `pair`'s shared edge `j`-`p` meets both units' outer edges."""
+    edges: dict[frozenset, set[str]] = {}
+    for code, geometry in geoms.items():
+        for ring in rings(geometry):
+            for u, v in itertools.pairwise(map(tuple, ring)):
+                edges.setdefault(frozenset((u, v)), set()).add(code)
+    for e in (e for e, owners in edges.items() if owners == pair):
+        for j in e:
+            p = next(v for v in e if v != j)
+            if any(len(vertex_at(geoms[c], j)) != 1 for c in pair):
+                continue
+            ends = {c: outer_end(geoms, edges, c, j, p) for c in pair}
+            if None not in ends.values() and math.dist(j, p) >= 2 * NOTCH_DEPTH_M:
+                return j, p, ends
+    msg = f"{sorted(pair)}: no shared border reaching the outer edge"
+    raise SystemExit(msg)
+
+
+def notch(geoms: dict[str, dict], unit: str, neighbour: str) -> None:
+    """Pull `unit` and `neighbour`'s shared border back from where it meets the outer edge."""
+    j, p, ends = junction(geoms, {unit, neighbour})
+    apex = along(j, p, NOTCH_DEPTH_M)
+    for code, q in ends.items():
+        ring, k = vertex_at(geoms[code], j)[0]
+        n = len(ring) - 1
+        seq = [along(j, q, NOTCH_MOUTH_M / 2), apex]
+        if tuple(ring[(k - 1) % n]) == p:
+            seq.reverse()
+        ring[:] = [*seq, *ring[k + 1 : n], *ring[:k], seq[0]]
+
+
 def topo_input(src: Path, out: Path) -> None:
-    """Every gemeente with its water, as one gap-free coverage, then the DISPLACED vertices."""
+    """Every gemeente with its water, as one gap-free coverage, then the DISPLACED and NOTCHED edits."""
     con = duckdb.connect()
     con.execute("LOAD spatial")
     con.execute(
@@ -282,10 +355,13 @@ def topo_input(src: Path, out: Path) -> None:
     }
     for unit, neighbour, m in DISPLACED:
         displace(con, geoms, unit, neighbour, m)
+    for unit, neighbour in NOTCHED:
+        notch(geoms, unit, neighbour)
+    edited = {u for u, *_ in DISPLACED} | {u for pair in NOTCHED for u in pair}
     con.execute("CREATE TABLE edits (gemeentecode VARCHAR, geojson VARCHAR)")
     con.executemany(
         "INSERT INTO edits VALUES (?, ?)",
-        [(unit, json.dumps(geoms[unit])) for unit, _, _ in DISPLACED],
+        [(unit, json.dumps(geoms[unit])) for unit in sorted(edited)],
     )
     copy(
         con,
@@ -312,6 +388,7 @@ def check_topo(path: Path, cache: Path) -> None:
     expected = {
         "overlap": sum(m > 0 for *_, m in DISPLACED),
         "gap": sum(m < 0 for *_, m in DISPLACED),
+        "notch": DISPLACED_NOTCHES + len(NOTCHED),
     }
     if (counts := issue_counts(path, cache)) != expected:
         msg = f"{path}: {counts}, expected {expected}"
@@ -330,9 +407,7 @@ def check_topo(path: Path, cache: Path) -> None:
         raise SystemExit(msg)
 
 
-def check_edge(
-    input_path: Path, overlay_path: Path, overlay_gaps: int, cache: Path
-) -> None:
+def check_edge(input_path: Path, overlay_path: Path, cache: Path) -> None:
     out = cache / "edge" / "nld_admin2_matched.parquet"
     out.parent.mkdir(parents=True, exist_ok=True)
     # One thread: multi-threaded edge-match output varies run to run, and package/names build on it.
@@ -340,7 +415,7 @@ def check_edge(
         input_path,
         overlay_path,
         out,
-        per_feature=True,
+        assign="many",
         threads=1,
         tmp_dir=cache / "tmp",
     )
@@ -350,8 +425,9 @@ def check_edge(
             "WHERE kind NOT IN ('micro-polygon', 'detached-part') GROUP BY kind"
         ).fetchall()
     )
-    if kinds != {"gap": overlay_gaps}:
-        msg = f"edge-match --per-feature reported {kinds}, expected only the overlay's {overlay_gaps} gaps"
+    # Overlay holes (the Baarle enclaves) lie outside every clip target, so they are not gaps.
+    if kinds:
+        msg = f"edge-match --assign many reported {kinds}"
         raise SystemExit(msg)
 
 
@@ -532,7 +608,7 @@ def build(catalog: Path, cache: Path) -> None:
     check_topo(topo_path, cache)
     edge_overlay_path = edge_path.with_stem("nld_admin1")
     edge_overlay(join_path, edge_overlay_path)
-    check_edge(edge_path, edge_overlay_path, counts[join_path]["gap"], cache)
+    check_edge(edge_path, edge_overlay_path, cache)
 
     old, new = (
         demo / "code" / "nld_admin2_2022.parquet",
