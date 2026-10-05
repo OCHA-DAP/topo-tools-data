@@ -1,3 +1,4 @@
+default_install_hook_types: [pre-commit, pre-push]
 default_language_version:
   python: python3.14
 repos:
@@ -20,3 +21,12 @@ repos:
     hooks:
       - id: ruff-format
       - id: ruff-check
+  - repo: local
+    hooks:
+      - id: no-push-to-finished-pr
+        name: don't push to a branch whose PR is merged or closed
+        language: system
+        entry: bash -c 'state=$(gh pr view --json state -q .state 2>/dev/null); case "$state" in MERGED|CLOSED) echo "This branch'"'"'s PR is $state. Branch off main instead."; exit 1;; esac'
+        stages: [pre-push]
+        pass_filenames: false
+        always_run: true
