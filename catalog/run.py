@@ -3,7 +3,9 @@
 import argparse
 import hashlib
 import json
+import logging
 from pathlib import Path
+from subprocess import CalledProcessError
 
 from annotate_nld import annotate_catalog
 from build_demo import build as build_demo
@@ -17,6 +19,7 @@ except ModuleNotFoundError:  # gitignored, only on the maintainer's machine
     build_sources = None
 
 DEMO_DATETIME = "2025-01-01"
+logger = logging.getLogger(__name__)
 
 
 def drop_stale_tiles(collection: Path) -> None:
@@ -90,6 +93,11 @@ def main() -> None:
     add_all(catalog, sources)
     annotate_catalog(catalog, args.cache)
     portolan(["readme"], cwd=catalog)
+    # readme rewrites READMEs after add recorded their checksums; --fix exits 1 while unfixable issues remain.
+    try:
+        portolan(["check", "--fix", "--data-scope", "local"], cwd=catalog)
+    except CalledProcessError:
+        logger.warning("portolan check --fix left issues it can't repair (continuing)")
     if args.push:
         push(catalog)
 
