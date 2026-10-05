@@ -3,7 +3,7 @@ name = "topo-tools-data"
 version = "0.1.0"
 description = "Build scripts for the hdx/topo-tools catalog on source.coop"
 requires-python = ">=3.14"
-dependencies = ["duckdb>=1.5.6", "pyyaml>=6.0.3", "topo-tools>=0.13.0"]
+dependencies = ["duckdb>=1.5.6", "pyyaml>=6.0.3", "topo-tools>=0.14.0"]
 
 [dependency-groups]
 dev = ["pre-commit", "ruff"]
