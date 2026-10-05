@@ -1,6 +1,8 @@
 """Rebuild the local portolan catalog end to end, optionally pushing it to source.coop."""
 
 import argparse
+import hashlib
+import json
 from pathlib import Path
 
 from annotate_nld import annotate_catalog
@@ -17,12 +19,32 @@ except ModuleNotFoundError:  # gitignored, only on the maintainer's machine
 DEMO_DATETIME = "2025-01-01"
 
 
+def drop_stale_tiles(collection: Path) -> None:
+    # portolan 0.8.0 fails instead of replacing the tileset of a parquet whose bytes changed since its last add.
+    for versions in collection.rglob("versions.json"):
+        data = json.loads(versions.read_text())
+        current = next(
+            (
+                v
+                for v in data.get("versions", [])
+                if v["version"] == data.get("current_version")
+            ),
+            None,
+        )
+        for name, asset in (current or {}).get("assets", {}).items():
+            parquet = versions.parent / name
+            tiles = parquet.with_suffix(".pmtiles")
+            if parquet.suffix != ".parquet" or not (
+                parquet.exists() and tiles.exists()
+            ):
+                continue
+            with parquet.open("rb") as f:
+                if hashlib.file_digest(f, "sha256").hexdigest() != asset["sha256"]:
+                    tiles.unlink()
+
+
 def add(catalog: Path, collection: str, datetime: str) -> None:
-    # portolan 0.8.0 fails instead of replacing a tileset older than its parquet.
-    for parquet in (catalog / collection).rglob("*.parquet"):
-        tiles = parquet.with_suffix(".pmtiles")
-        if tiles.exists() and tiles.stat().st_mtime < parquet.stat().st_mtime:
-            tiles.unlink()
+    drop_stale_tiles(catalog / collection)
     portolan(["add", collection, "--pmtiles", "--datetime", datetime], cwd=catalog)
 
 
