@@ -9,7 +9,7 @@ from pathlib import Path
 
 import duckdb
 import yaml
-from build_demo import CRUMB_M2, DISPLACED, NAME_FIXES, NAMES
+from build_demo import CRUMB_M2, NAME_FIXES, NAMES, SHIFT_M
 from build_nld import ADMIN, YEARS, dataset_feed
 
 LEVEL = {admin: level for level, admin in ADMIN.items()}
@@ -95,7 +95,7 @@ DEMO["edge"] = {
 }
 DEMO["topo"] = {
     "title": "Gemeenten 2025 with digitization errors",
-    "description": "The 343 gemeenten from the CBS Wijk- en Buurtkaart 2025, each with its water, in EPSG:28992 with `adm2_code` and `adm2_name`, simplified to 100 m. Five border vertices are moved 15 to 30 m, giving two overlaps and three gaps. Running topo-detect reports those five issues. Running topo-clean with the thin maximum gap width fixes all five. See [AGENTS.md](AGENTS.md).",
+    "description": "The 343 gemeenten from the CBS Wijk- en Buurtkaart 2025, each with its water, in EPSG:28992 with `adm2_code` and `adm2_name`, simplified to 100 m. Zeeland's gemeenten are shifted about 7 m, as if Zeeland digitized them on its own base map, so its borders with Zuid-Holland and Noord-Brabant come apart into gaps and overlaps. Running topo-detect reports them. Running topo-clean with the thin maximum gap width fixes them. See [AGENTS.md](AGENTS.md).",
     "keywords": [
         "administrative boundaries",
         "Netherlands",
@@ -105,7 +105,7 @@ DEMO["topo"] = {
         "topo-detect",
         "topo-clean",
     ],
-    "processing_notes": "Built by `catalog/build_demo.py` in [topo-tools-data](https://github.com/OCHA-DAP/topo-tools-data) from `nld/2025/nld_admin2`: land and water rows unioned per `gemeentecode`, `ST_CoverageSimplify` at 100 m, then `ST_CoverageClean` with 0.01 m snapping and no gap filling. One vertex on each of five shared borders is then moved perpendicular to the border, into the neighbour for an overlap or back into the gemeente for a gap.",
+    "processing_notes": "Built by `catalog/build_demo.py` in [topo-tools-data](https://github.com/OCHA-DAP/topo-tools-data) from `nld/2025/nld_admin2`: land and water rows unioned per `gemeentecode`, `ST_CoverageSimplify` at 100 m, then `ST_CoverageClean` with 0.01 m snapping and no gap filling. Every Zeeland gemeente is then moved by the same offset, 4 m east and 6 m north.",
 }
 DEMO["code"] = {
     "title": "Gemeenten 2022 and 2023 for code-update",
@@ -610,29 +610,25 @@ def annotate_topo(collection_dir: Path, cache: Path) -> None:
     url = f"{DATA}/nld/demo/topo/nld_admin2.parquet"
     con = duckdb.connect()
     con.execute("LOAD spatial")
-    names = dict(
-        con.execute(
-            f"SELECT adm2_code, adm2_name FROM read_parquet('{collection_dir / 'nld_admin2.parquet'}')"
-        ).fetchall()
-    )
-    overlap_issues, gap_issues, min_w, max_w = con.execute(
+    rows = con.execute(
+        f"SELECT count(*) FROM read_parquet('{collection_dir / 'nld_admin2.parquet'}')"
+    ).fetchone()[0]
+    overlap_issues, gap_issues, notch_issues, max_w = con.execute(
         "SELECT count(*) FILTER (kind = 'overlap'), count(*) FILTER (kind = 'gap'), "
-        "min(max_width_m), max(max_width_m) "
+        "count(*) FILTER (kind = 'notch'), max(max_width_m) "
         f"FROM read_parquet('{cache / 'topo_nld_admin2_issues.parquet'}')"
     ).fetchone()
     (collection_dir / "AGENTS.md").write_text(
         template(
             "demo_topo",
             title=DEMO["topo"]["title"],
-            rows=str(len(names)),
-            errors="\n".join(
-                f"| {'Overlap' if m > 0 else 'Gap'} | {names[unit]} | {names[neighbour]} | {abs(m):g} m |"
-                for unit, neighbour, m in DISPLACED
-            ),
+            rows=str(rows),
+            dx=f"{SHIFT_M[0]:g}",
+            dy=f"{SHIFT_M[1]:g}",
             url=url,
             overlap_issues=str(overlap_issues),
             gap_issues=str(gap_issues),
-            min_w=f"{min_w:.0f}",
+            notch_issues=str(notch_issues),
             max_w=f"{max_w:.0f}",
             web=WEB,
         )

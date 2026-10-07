@@ -1,9 +1,6 @@
 """Build the hdx/topo-tools NLD demo inputs: one folder per topo-tools tool."""
 
 import argparse
-import itertools
-import json
-import math
 import unicodedata
 from pathlib import Path
 
@@ -26,22 +23,10 @@ SNAP_M = 0.01
 CRUMB_M2 = 10_000.0
 # Vlissingen's Sloe harbour parts sit inside Borsele, and their split pier stripes edge-match.
 MAIN_PART_ONLY = ("GM0718",)
-# (unit, neighbour, metres): one vertex on their shared border moves into the neighbour
-# (positive, an overlap) or back into the unit (negative, a gap).
-DISPLACED = [
-    ("GM0344", "GM0310", 30.0),
-    ("GM0363", "GM0362", 25.0),
-    ("GM0599", "GM0542", -20.0),
-    ("GM0772", "GM0861", -15.0),
-    ("GM0014", "GM1966", -25.0),
-]
-# topo-detect also reports these wedges' thin tips as notches.
-DISPLACED_NOTCHES = 9
-# (unit, neighbour): their shared border stops NOTCH_DEPTH_M short of the national border,
-# leaving a NOTCH_MOUTH_M wide wedge that topo-clean closes into a T junction.
-NOTCHED = [("GM0109", "GM0114"), ("GM0153", "GM0168"), ("GM0858", "GM1724")]
-NOTCH_DEPTH_M = 200.0
-NOTCH_MOUTH_M = 10.0
+# Zeeland digitized its gemeenten on a base map shifted (dx, dy) metres, so only its borders
+# with Zuid-Holland and Noord-Brabant disagree.
+SHIFTED_PROVINCIE = "PV29"
+SHIFT_M = (4.0, 6.0)
 # (code, name, stored name, finding): one of each kind name-detect reports.
 NAMES = [
     (
@@ -128,14 +113,19 @@ def cached(url: str, path: Path) -> Path:
     return path
 
 
-def gemeenten(src: Path, provinces: Path) -> duckdb.DuckDBPyConnection:
-    """Simplified land gemeenten with provincie columns, as table `g`."""
-    con = duckdb.connect()
-    con.execute("LOAD spatial")
+def provincies(con: duckdb.DuckDBPyConnection, provinces: Path) -> None:
+    """Load the CBS gemeente-to-provincie lookup as table `p`."""
     con.execute(
         f"CREATE TABLE p AS SELECT trim(r.RegioS) AS gemeentecode, trim(r.Code_28) AS provinciecode, "
         f"trim(r.Naam_29) AS provincienaam FROM (SELECT unnest(value) AS r FROM read_json('{provinces}'))"
     )
+
+
+def gemeenten(src: Path, provinces: Path) -> duckdb.DuckDBPyConnection:
+    """Simplified land gemeenten with provincie columns, as table `g`."""
+    con = duckdb.connect()
+    con.execute("LOAD spatial")
+    provincies(con, provinces)
     con.execute(
         f"CREATE TABLE t AS SELECT row_number() OVER (ORDER BY gemeentecode) AS i, * EXCLUDE (bbox) "
         f"FROM read_parquet('{src}') WHERE water = 'NEE'"
@@ -227,147 +217,27 @@ def edge_overlay(join_path: Path, out: Path) -> None:
     )
 
 
-def rings(geometry: dict) -> list[list[list[float]]]:
-    polygons = geometry["coordinates"]
-    if geometry["type"] == "Polygon":
-        polygons = [polygons]
-    return [ring for polygon in polygons for ring in polygon]
-
-
-def displace(
-    con: duckdb.DuckDBPyConnection,
-    geoms: dict[str, dict],
-    unit: str,
-    neighbour: str,
-    m: float,
-) -> None:
-    """Move the middle vertex of `unit`'s border with `neighbour` `m` metres across it."""
-    owners: dict[tuple[float, float], set[str]] = {}
-    for code, geometry in geoms.items():
-        for ring in rings(geometry):
-            for v in ring:
-                owners.setdefault(tuple(v), set()).add(code)
-    pair = {unit, neighbour}
-    ring = next(
-        r for r in rings(geoms[unit]) if any(owners[tuple(v)] == pair for v in r)
-    )
-    n = len(ring) - 1
-    # Both neighbours on the same border, so only this pair's edges move.
-    border = [
-        k
-        for k in range(n)
-        if all(owners[tuple(ring[(k + d) % n])] >= pair for d in (-1, 0, 1))
-        and owners[tuple(ring[k])] == pair
-    ]
-    k = border[len(border) // 2]
-    (px, py), (qx, qy), (x, y) = ring[(k - 1) % n], ring[(k + 1) % n], ring[k]
-    length = math.hypot(qx - px, qy - py)
-    nx, ny = (py - qy) / length, (qx - px) / length
-    target = neighbour if m > 0 else unit
-    for sign in (1, -1):
-        point = [x + sign * nx * abs(m), y + sign * ny * abs(m)]
-        inside = con.execute(
-            "SELECT ST_Contains(geometry, ST_Point(?, ?)) FROM w WHERE gemeentecode = ?",
-            [*point, target],
-        ).fetchone()[0]
-        if inside:
-            ring[k] = point
-            if k == 0:
-                ring[n] = point
-            return
-    msg = f"{unit}: no side of its border with {neighbour} lies in {target}"
-    raise SystemExit(msg)
-
-
-def vertex_at(geometry: dict, j: tuple) -> list[tuple[list, int]]:
-    return [
-        (ring, k)
-        for ring in rings(geometry)
-        for k in range(len(ring) - 1)
-        if tuple(ring[k]) == j
-    ]
-
-
-def along(j: tuple, q: tuple, m: float) -> list[float]:
-    d = math.dist(j, q)
-    return [j[0] + (q[0] - j[0]) * m / d, j[1] + (q[1] - j[1]) * m / d]
-
-
-def outer_end(
-    geoms: dict[str, dict], edges: dict, code: str, j: tuple, p: tuple
-) -> tuple | None:
-    """Return `code`'s other neighbour of `j`, past `p`, along an edge no other unit has."""
-    ring, k = vertex_at(geoms[code], j)[0]
-    n = len(ring) - 1
-    sides = {tuple(ring[(k - 1) % n]), tuple(ring[(k + 1) % n])} - {p}
-    return next((q for q in sides if edges[frozenset((j, q))] == {code}), None)
-
-
-def junction(
-    geoms: dict[str, dict], pair: set[str]
-) -> tuple[tuple, tuple, dict[str, tuple]]:
-    """Find a vertex `j` where `pair`'s shared edge `j`-`p` meets both units' outer edges."""
-    edges: dict[frozenset, set[str]] = {}
-    for code, geometry in geoms.items():
-        for ring in rings(geometry):
-            for u, v in itertools.pairwise(map(tuple, ring)):
-                edges.setdefault(frozenset((u, v)), set()).add(code)
-    for e in (e for e, owners in edges.items() if owners == pair):
-        for j in e:
-            p = next(v for v in e if v != j)
-            if any(len(vertex_at(geoms[c], j)) != 1 for c in pair):
-                continue
-            ends = {c: outer_end(geoms, edges, c, j, p) for c in pair}
-            if None not in ends.values() and math.dist(j, p) >= 2 * NOTCH_DEPTH_M:
-                return j, p, ends
-    msg = f"{sorted(pair)}: no shared border reaching the outer edge"
-    raise SystemExit(msg)
-
-
-def notch(geoms: dict[str, dict], unit: str, neighbour: str) -> None:
-    """Pull `unit` and `neighbour`'s shared border back from where it meets the outer edge."""
-    j, p, ends = junction(geoms, {unit, neighbour})
-    apex = along(j, p, NOTCH_DEPTH_M)
-    for code, q in ends.items():
-        ring, k = vertex_at(geoms[code], j)[0]
-        n = len(ring) - 1
-        seq = [along(j, q, NOTCH_MOUTH_M / 2), apex]
-        if tuple(ring[(k - 1) % n]) == p:
-            seq.reverse()
-        ring[:] = [*seq, *ring[k + 1 : n], *ring[:k], seq[0]]
-
-
-def topo_input(src: Path, out: Path) -> None:
-    """Every gemeente with its water, as one gap-free coverage, then the DISPLACED and NOTCHED edits."""
+def topo_input(src: Path, provinces: Path, out: Path) -> None:
+    """Every gemeente with its water as one gap-free coverage, then SHIFTED_PROVINCIE moved by SHIFT_M."""
     con = duckdb.connect()
     con.execute("LOAD spatial")
+    provincies(con, provinces)
     con.execute(
         "CREATE TABLE w AS SELECT row_number() OVER (ORDER BY gemeentecode) AS i, gemeentecode, "
         "any_value(gemeentenaam) AS gemeentenaam, ST_Union_Agg(geometry::GEOMETRY) AS geometry "
         f"FROM read_parquet('{src}') GROUP BY gemeentecode"
     )
     simplify(con, "w")
-    geoms = {
-        code: json.loads(g)
-        for code, g in con.execute(
-            "SELECT gemeentecode, ST_AsGeoJSON(geometry) FROM w"
-        ).fetchall()
-    }
-    for unit, neighbour, m in DISPLACED:
-        displace(con, geoms, unit, neighbour, m)
-    for unit, neighbour in NOTCHED:
-        notch(geoms, unit, neighbour)
-    edited = {u for u, *_ in DISPLACED} | {u for pair in NOTCHED for u in pair}
-    con.execute("CREATE TABLE edits (gemeentecode VARCHAR, geojson VARCHAR)")
-    con.executemany(
-        "INSERT INTO edits VALUES (?, ?)",
-        [(unit, json.dumps(geoms[unit])) for unit in sorted(edited)],
+    con.execute(
+        "CREATE TABLE r AS SELECT gemeentecode, gemeentenaam, CASE WHEN provinciecode = ? "
+        "THEN ST_Affine(geometry::GEOMETRY, 1, 0, 0, 1, ?, ?) ELSE geometry::GEOMETRY END AS geometry "
+        "FROM w LEFT JOIN p USING (gemeentecode)",
+        [SHIFTED_PROVINCIE, *SHIFT_M],
     )
     copy(
         con,
-        "SELECT coalesce(ST_GeomFromGeoJSON(e.geojson), w.geometry::GEOMETRY)::GEOMETRY('EPSG:28992') AS geometry, "
-        "gemeentecode AS adm2_code, gemeentenaam AS adm2_name "
-        "FROM w LEFT JOIN edits e USING (gemeentecode) ORDER BY adm2_code",
+        "SELECT geometry::GEOMETRY('EPSG:28992') AS geometry, "
+        "gemeentecode AS adm2_code, gemeentenaam AS adm2_name FROM r ORDER BY adm2_code",
         out,
     )
 
@@ -385,13 +255,9 @@ def issue_counts(path: Path, cache: Path) -> dict[str, int]:
 
 
 def check_topo(path: Path, cache: Path) -> None:
-    expected = {
-        "overlap": sum(m > 0 for *_, m in DISPLACED),
-        "gap": sum(m < 0 for *_, m in DISPLACED),
-        "notch": DISPLACED_NOTCHES + len(NOTCHED),
-    }
-    if (counts := issue_counts(path, cache)) != expected:
-        msg = f"{path}: {counts}, expected {expected}"
+    counts = issue_counts(path, cache)
+    if not counts.get("overlap") or not counts.get("gap"):
+        msg = f"{path}: {counts}, expected overlaps and gaps"
         raise SystemExit(msg)
     out = cache / "topo" / "nld_admin2_clean.parquet"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -583,10 +449,11 @@ def build(catalog: Path, cache: Path) -> None:
     edge_path = demo / "edge" / "nld_admin2.parquet"
     mapped = cache / "schema-map" / "nld_admin2_mapped.parquet"
 
-    con = gemeenten(src, cached(GEBIEDEN, cache / "gebieden_2025.json"))
+    gebieden = cached(GEBIEDEN, cache / "gebieden_2025.json")
+    con = gemeenten(src, gebieden)
     schema_map_input(con, raw)
     schema_join_input(con, input_path)
-    topo_input(src, topo_path)
+    topo_input(src, gebieden, topo_path)
     edge_input(con, edge_path)
     schema_join_layer(
         cached(PROVINCIEGEBIED, cache / "provinciegebied.json"), join_path
